@@ -60,6 +60,8 @@ pub enum DragPhase {
         c0: Vec3,
         last_raw: Vec3,
         m0: HmdMatrix34_t,
+        last_m: HmdMatrix34_t,
+        moved: bool,
     },
 }
 
@@ -67,6 +69,7 @@ pub enum DragPhase {
 pub enum StepAction {
     Idle,
     UpdatePlayspace(HmdMatrix34_t),
+    CommitPlayspace(HmdMatrix34_t),
     AbortDrag,
 }
 
@@ -157,6 +160,8 @@ impl DragStateMachine {
                 c0,
                 last_raw,
                 m0,
+                last_m,
+                moved,
             } => {
                 let other = Self::other_hand(hand);
                 if frame.hand(other).pressed {
@@ -166,7 +171,11 @@ impl DragStateMachine {
                 let active = frame.hand(hand);
                 if !active.pressed {
                     self.phase = DragPhase::Idle;
-                    return StepAction::Idle;
+                    return if moved {
+                        StepAction::CommitPlayspace(last_m)
+                    } else {
+                        StepAction::Idle
+                    };
                 }
 
                 if !active.has_valid_pose() || active.device_index != device_index {
@@ -179,15 +188,17 @@ impl DragStateMachine {
                     return StepAction::Idle;
                 }
 
+                let delta = self.simd.sub_vec3(active.position_raw, c0);
+                let m_new = self.simd.apply_raw_translation(&m0, delta);
                 self.phase = DragPhase::Dragging {
                     hand,
                     device_index,
                     c0,
                     last_raw: active.position_raw,
                     m0,
+                    last_m: m_new,
+                    moved: true,
                 };
-                let delta = self.simd.sub_vec3(active.position_raw, c0);
-                let m_new = self.simd.apply_raw_translation(&m0, delta);
                 StepAction::UpdatePlayspace(m_new)
             }
             DragPhase::Idle => {
@@ -239,8 +250,10 @@ impl DragStateMachine {
                     c0: input.position_raw,
                     last_raw: input.position_raw,
                     m0,
+                    last_m: m0,
+                    moved: false,
                 };
-                StepAction::UpdatePlayspace(m0)
+                StepAction::Idle
             }
         }
     }
@@ -275,7 +288,7 @@ mod tests {
             left: hand(true, 1, (0.0, 1.0, 0.0)),
             right: hand(false, 2, (0.5, 1.0, 0.0)),
         };
-        assert_eq!(sm.step(f1, Some(m0)), StepAction::UpdatePlayspace(m0));
+        assert_eq!(sm.step(f1, Some(m0)), StepAction::Idle);
         assert!(sm.is_dragging());
 
         // Move left by (0.3, -0.2, 0.5), move right wildly (ignored).
@@ -287,12 +300,12 @@ mod tests {
         let expected_m1 = apply_raw_translation(&m0, delta1);
         assert_eq!(sm.step(f2, None), StepAction::UpdatePlayspace(expected_m1));
 
-        // Release left -> Idle, offset preserved.
+        // Release left -> Idle and commit final pose.
         let f3 = InputFrame {
             left: hand(false, 1, (0.3, 0.8, 0.5)),
             right: hand(false, 2, (9.0, 9.0, 9.0)),
         };
-        assert_eq!(sm.step(f3, None), StepAction::Idle);
+        assert_eq!(sm.step(f3, None), StepAction::CommitPlayspace(expected_m1));
         assert!(!sm.is_dragging());
 
         // Re-drag with right hand starting from preserved expected_m1.
@@ -300,10 +313,7 @@ mod tests {
             left: hand(false, 1, (0.3, 0.8, 0.5)),
             right: hand(true, 2, (1.0, 1.0, 1.0)),
         };
-        assert_eq!(
-            sm.step(f4, Some(expected_m1)),
-            StepAction::UpdatePlayspace(expected_m1)
-        );
+        assert_eq!(sm.step(f4, Some(expected_m1)), StepAction::Idle);
         let f5 = InputFrame {
             left: hand(false, 1, (0.3, 0.8, 0.5)),
             right: hand(true, 2, (1.2, 1.1, 0.75)),
@@ -327,7 +337,7 @@ mod tests {
             left: hand(true, 1, (0.0, 1.0, 0.0)),
             right: hand(true, 2, (0.5, 1.0, 0.0)),
         };
-        assert_eq!(sm.step(both, Some(m0)), StepAction::UpdatePlayspace(m0));
+        assert_eq!(sm.step(both, Some(m0)), StepAction::Idle);
         assert_eq!(sm.active_device_hint(), Some((Hand::Left, 1)));
 
         // Right controller moves while held: must not affect output.
@@ -335,9 +345,10 @@ mod tests {
             left: hand(true, 1, (0.2, 1.0, 0.0)),
             right: hand(true, 2, (5.0, 5.0, 5.0)),
         };
+        let expected_m = apply_raw_translation(&m0, Vec3::new(0.2, 0.0, 0.0));
         assert_eq!(
             sm.step(right_moves, None),
-            StepAction::UpdatePlayspace(apply_raw_translation(&m0, Vec3::new(0.2, 0.0, 0.0)))
+            StepAction::UpdatePlayspace(expected_m)
         );
 
         // Left releases while Right is STILL held -> must end drag cleanly without switching to Right!
@@ -345,7 +356,10 @@ mod tests {
             left: hand(false, 1, (0.2, 1.0, 0.0)),
             right: hand(true, 2, (5.0, 5.0, 5.0)),
         };
-        assert_eq!(sm.step(left_released, None), StepAction::Idle);
+        assert_eq!(
+            sm.step(left_released, None),
+            StepAction::CommitPlayspace(expected_m)
+        );
         assert!(!sm.is_dragging());
         // Still holding Right on next frame remains Idle.
         assert_eq!(sm.step(left_released, Some(m0)), StepAction::Idle);
@@ -360,7 +374,7 @@ mod tests {
             left: hand(false, 1, (0.2, 1.0, 0.0)),
             right: hand(true, 2, (1.0, 1.0, 1.0)),
         };
-        assert_eq!(sm.step(right_down, Some(m0)), StepAction::UpdatePlayspace(m0));
+        assert_eq!(sm.step(right_down, Some(m0)), StepAction::Idle);
         assert_eq!(sm.active_device_hint(), Some((Hand::Right, 2)));
     }
 
@@ -374,7 +388,7 @@ mod tests {
             left: hand(false, 1, (0.0, 0.0, 0.0)),
             right: hand(true, 2, (0.0, 1.0, 0.0)),
         };
-        assert_eq!(sm.step(r_down, Some(m0)), StepAction::UpdatePlayspace(m0));
+        assert_eq!(sm.step(r_down, Some(m0)), StepAction::Idle);
 
         // Left presses during active Right drag -> Right remains active.
         let both = InputFrame {
@@ -385,12 +399,12 @@ mod tests {
         assert_eq!(sm.step(both, None), StepAction::UpdatePlayspace(m1));
         assert_eq!(sm.active_device_hint(), Some((Hand::Right, 2)));
 
-        // Right releases while Left still held -> goes Idle, does NOT switch to Left.
+        // Right releases while Left still held -> goes Idle, commits m1, does NOT switch to Left.
         let r_up = InputFrame {
             left: hand(true, 1, (10.0, 10.0, 10.0)),
             right: hand(false, 2, (0.0, 1.4, 0.0)),
         };
-        assert_eq!(sm.step(r_up, None), StepAction::Idle);
+        assert_eq!(sm.step(r_up, None), StepAction::CommitPlayspace(m1));
         assert!(!sm.is_dragging());
         assert_eq!(sm.step(r_up, Some(m1)), StepAction::Idle);
     }
@@ -405,7 +419,7 @@ mod tests {
             left: hand(true, 1, (0.0, 1.0, 0.0)),
             right: HandInput::UNPRESSED,
         };
-        assert_eq!(sm.step(f1, Some(m0)), StepAction::UpdatePlayspace(m0));
+        assert_eq!(sm.step(f1, Some(m0)), StepAction::Idle);
 
         // Drag to (0.5, 1, 0).
         let f2 = InputFrame {
@@ -437,10 +451,7 @@ mod tests {
             left: hand(true, 1, (2.0, 1.0, 0.0)),
             right: hand(true, 2, (0.0, 0.0, 0.0)),
         };
-        assert_eq!(
-            sm.step(f_recover, Some(preserved_m)),
-            StepAction::UpdatePlayspace(preserved_m)
-        );
+        assert_eq!(sm.step(f_recover, Some(preserved_m)), StepAction::Idle);
 
         // Moving +0.1 in Z from new capture adds +0.1 to preserved_m.
         let f_after = InputFrame {
@@ -466,7 +477,7 @@ mod tests {
                 },
                 Some(m0)
             ),
-            StepAction::UpdatePlayspace(m0)
+            StepAction::Idle
         );
 
         // Oscillate 10,000 times and return to c0 -> transform must return to exact m0.
@@ -500,9 +511,15 @@ mod tests {
             left: hand(true, 1, (0.2, 1.0, -0.3)),
             right: HandInput::UNPRESSED,
         };
-        assert_eq!(sm.step(f, Some(m0)), StepAction::UpdatePlayspace(m0));
+        assert_eq!(sm.step(f, Some(m0)), StepAction::Idle);
         assert!(sm.is_dragging());
         assert_eq!(sm.step(f, None), StepAction::Idle);
         assert!(sm.is_dragging());
+        let released = InputFrame {
+            left: hand(false, 1, (0.2, 1.0, -0.3)),
+            right: HandInput::UNPRESSED,
+        };
+        assert_eq!(sm.step(released, None), StepAction::Idle);
+        assert!(!sm.is_dragging());
     }
 }

@@ -67,6 +67,25 @@ impl HmdMatrix34_t {
         Vec3::new(self.m[0][3], self.m[1][3], self.m[2][3])
     }
 
+    /// Computes the exact rigid-body inverse `M^{-1} = [R^T | -R^T * t]`.
+    #[inline]
+    pub fn invert_rigid(&self) -> Self {
+        let mut inv = Self::IDENTITY;
+        let mut r = 0;
+        while r < 3 {
+            let mut c = 0;
+            while c < 3 {
+                inv.m[r][c] = self.m[c][r];
+                c += 1;
+            }
+            inv.m[r][3] = -(inv.m[r][0] * self.m[0][3]
+                + inv.m[r][1] * self.m[1][3]
+                + inv.m[r][2] * self.m[2][3]);
+            r += 1;
+        }
+        inv
+    }
+
     #[inline]
     pub fn is_finite(&self) -> bool {
         let mut r = 0;
@@ -609,5 +628,40 @@ mod tests {
         let p_base = baseline.raw_to_standing_point(&m_base, p_raw);
         assert!(approx_eq(p_simd, p_scalar, 1e-5));
         assert!(approx_eq(p_base, p_scalar, 1e-5));
+    }
+
+    #[test]
+    fn invert_rigid_round_trips_and_matches_standing_transform() {
+        let m = yaw_matrix(0.87, -2.35, 1.42, 3.18);
+        let inv = m.invert_rigid();
+        let round_trip = inv.invert_rigid();
+
+        for r in 0..3 {
+            for c in 0..4 {
+                assert!(
+                    (round_trip.m[r][c] - m.m[r][c]).abs() < 1e-5,
+                    "mismatch at [{r}][{c}]: got {}, expected {}",
+                    round_trip.m[r][c],
+                    m.m[r][c]
+                );
+            }
+        }
+
+        // Treat `m` as raw_to_standing: P_stand = R * P_raw + t.
+        // Then `stand_to_raw = m.invert_rigid()`, and `raw_to_standing_point(&stand_to_raw, p_raw)`
+        // must produce the exact same P_stand.
+        let p_raw = Vec3::new(0.45, 1.62, -0.78);
+        let direct = Vec3::new(
+            m.m[0][0] * p_raw.x + m.m[0][1] * p_raw.y + m.m[0][2] * p_raw.z + m.m[0][3],
+            m.m[1][0] * p_raw.x + m.m[1][1] * p_raw.y + m.m[1][2] * p_raw.z + m.m[1][3],
+            m.m[2][0] * p_raw.x + m.m[2][1] * p_raw.y + m.m[2][2] * p_raw.z + m.m[2][3],
+        );
+        let via_inverse = raw_to_standing_point(&inv, p_raw);
+        assert!(
+            approx_eq(via_inverse, direct, 1e-5),
+            "got {:?}, expected {:?}",
+            via_inverse,
+            direct
+        );
     }
 }

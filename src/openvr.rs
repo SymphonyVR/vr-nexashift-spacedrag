@@ -16,6 +16,7 @@ pub const E_TRACKED_CONTROLLER_ROLE_LEFT_HAND: i32 = 1;
 pub const E_TRACKED_CONTROLLER_ROLE_RIGHT_HAND: i32 = 2;
 pub const PROP_DISPLAY_FREQUENCY_FLOAT: i32 = 2002;
 pub const VR_EVENT_QUIT: u32 = 700;
+pub const E_CHAPERONE_CONFIG_FILE_LIVE: i32 = 1;
 
 pub const VR_INIT_ERROR_NONE: i32 = 0;
 pub const VR_INPUT_ERROR_NONE: i32 = 0;
@@ -142,7 +143,7 @@ pub struct VR_IVRSystem_FnTable {
 
 #[repr(C)]
 pub struct VR_IVRChaperoneSetup_FnTable {
-    pub commit_working_copy: *const c_void,
+    pub commit_working_copy: unsafe extern "system" fn(config_file: i32) -> bool,
     pub revert_working_copy: unsafe extern "system" fn(),
     pub get_working_play_area_size: *const c_void,
     pub get_working_play_area_rect: *const c_void,
@@ -309,11 +310,6 @@ impl OpenVrSession {
             get_table(b"FnTable:IVRInput_010\0", "IVRInput_010")? as *const VR_IVRInput_FnTable;
         let vr_overlay = get_table(b"FnTable:IVROverlay_026\0", "IVROverlay_026")?
             as *const VR_IVROverlay_FnTable;
-
-        // Synchronize the working set once on startup without touching disk.
-        unsafe {
-            ((*chaperone_setup).revert_working_copy)();
-        }
 
         let mut action_set_main = 0u64;
         let mut action_space_drag = 0u64;
@@ -602,20 +598,29 @@ impl OpenVrSession {
 
     pub fn get_working_standing_pose(&self) -> Option<HmdMatrix34_t> {
         let mut mat = HmdMatrix34_t::IDENTITY;
-        let ok = unsafe {
-            ((*self.chaperone_setup).get_working_standing_zero_pose_to_raw_tracking_pose)(&mut mat)
-        };
-        if ok {
-            return Some(mat);
-        }
-
         unsafe {
             ((*self.chaperone_setup).revert_working_copy)();
         }
-        let ok_retry = unsafe {
+        let ok = unsafe {
             ((*self.chaperone_setup).get_working_standing_zero_pose_to_raw_tracking_pose)(&mut mat)
         };
-        if ok_retry { Some(mat) } else { None }
+        if ok && mat.is_finite() {
+            Some(mat)
+        } else {
+            None
+        }
+    }
+
+    pub fn peek_working_standing_pose(&self) -> Option<HmdMatrix34_t> {
+        let mut mat = HmdMatrix34_t::IDENTITY;
+        let ok = unsafe {
+            ((*self.chaperone_setup).get_working_standing_zero_pose_to_raw_tracking_pose)(&mut mat)
+        };
+        if ok && mat.is_finite() {
+            Some(mat)
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -623,6 +628,14 @@ impl OpenVrSession {
         unsafe {
             ((*self.chaperone_setup).set_working_standing_zero_pose_to_raw_tracking_pose)(mat);
             ((*self.chaperone_setup).show_working_set_preview)();
+        }
+    }
+
+    #[inline]
+    pub fn commit_working_standing_pose(&self, mat: &HmdMatrix34_t) -> bool {
+        unsafe {
+            ((*self.chaperone_setup).set_working_standing_zero_pose_to_raw_tracking_pose)(mat);
+            ((*self.chaperone_setup).commit_working_copy)(E_CHAPERONE_CONFIG_FILE_LIVE)
         }
     }
 }

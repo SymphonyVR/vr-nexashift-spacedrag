@@ -9,7 +9,7 @@ use nexashift::platform::{
     MonotonicClock, ReactiveWaiter, StackBuf, command_line_has_flag, install_signal_handlers,
     is_running, query_chaperone_file_stamp, query_process_stats, write_stderr, write_stdout,
 };
-use nexashift::state::{DragStateMachine, HandInput, InputFrame, StepAction};
+use nexashift::state::{DragPhase, DragStateMachine, HandInput, InputFrame, StepAction};
 
 #[cfg(all(not(test), target_os = "windows"))]
 #[link(name = "vcruntime")]
@@ -157,7 +157,7 @@ fn run_poc(simd: SimdMath) -> i32 {
         }
         sum_ns = sum_ns.saturating_add(dt);
 
-        if let Some(readback) = session.get_working_standing_pose() {
+        if let Some(readback) = session.peek_working_standing_pose() {
             if mat_translation_close(&readback, &target, 1e-5) {
                 verified_steps += 1;
             }
@@ -169,13 +169,14 @@ fn run_poc(simd: SimdMath) -> i32 {
 
     // Restore original M0 cleanly.
     session.apply_working_standing_pose(&m0);
-    let restored_ok = match session.get_working_standing_pose() {
+    let restored_ok = match session.peek_working_standing_pose() {
         Some(rb) => mat_translation_close(&rb, &m0, 1e-5),
         None => false,
     };
 
     let chap_after = query_chaperone_file_stamp();
     let chaperone_unmodified = chap_before.is_some() && chap_before == chap_after;
+    let _ = session.commit_working_standing_pose(&m0);
     let stats_after = query_process_stats();
     let ipc_write_bytes = stats_after.write_bytes.saturating_sub(stats_before.write_bytes);
     let avg_us = (sum_ns / steps) as f64 / 1000.0;
@@ -322,6 +323,7 @@ fn run_bench(simd: SimdMath) -> i32 {
     let drag_end_stats = query_process_stats();
     let drag_chap_after = query_chaperone_file_stamp();
     let drag_chap_modified = drag_chap_before != drag_chap_after;
+    let _ = session.commit_working_standing_pose(&m0);
     let drag_cpu_ns = drag_end_stats
         .cpu_time_ns
         .saturating_sub(drag_start_stats.cpu_time_ns);
@@ -376,11 +378,24 @@ fn run_daemon(simd: SimdMath) -> i32 {
         }
 
         let frame = session.sample_inputs(sm.active_device_hint());
-        if let StepAction::UpdatePlayspace(m) =
-            sm.step_with(frame, || session.get_working_standing_pose())
-        {
-            session.apply_working_standing_pose(&m);
+        match sm.step_with(frame, || session.get_working_standing_pose()) {
+            StepAction::UpdatePlayspace(m) => {
+                session.apply_working_standing_pose(&m);
+            }
+            StepAction::CommitPlayspace(m) => {
+                let _ = session.commit_working_standing_pose(&m);
+            }
+            StepAction::Idle | StepAction::AbortDrag => {}
         }
+    }
+
+    if let DragPhase::Dragging {
+        moved: true,
+        last_m,
+        ..
+    } = sm.phase()
+    {
+        let _ = session.commit_working_standing_pose(&last_m);
     }
 
     0
