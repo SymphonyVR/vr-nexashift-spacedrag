@@ -1,0 +1,30 @@
+{
+  "alias_info": {},
+  "bindings": {
+    "/actions/main": {
+      "sources": [
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/grip"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/grip"
+        }
+      ]
+    }
+  },
+  "controller_type": "oculus_touch",
+  "description": "Default NexaShift Space Drag bindings for Oculus Touch Controllers",
+  "name": "NexaShift Oculus Touch Default"
+}

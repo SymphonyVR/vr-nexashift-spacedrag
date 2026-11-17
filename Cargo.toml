@@ -1,0 +1,26 @@
+[package]
+name = "nexashift"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Headless #![no_std] OpenVR 1:1 3D playspace drag utility"
+
+[lib]
+name = "nexashift"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexashift"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

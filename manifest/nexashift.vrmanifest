@@ -1,0 +1,19 @@
+{
+  "source": "builtin",
+  "applications": [
+    {
+      "app_key": "nexashift.spacedrag",
+      "launch_type": "binary",
+      "binary_path_windows": "../nexashift.exe",
+      "binary_path_linux": "../nexashift",
+      "is_dashboard_overlay": false,
+      "action_manifest_path": "actions.json",
+      "strings": {
+        "en_us": {
+          "name": "NexaShift",
+          "description": "Headless 1:1 3D playspace dragging utility for SteamVR"
+        }
+      }
+    }
+  ]
+}

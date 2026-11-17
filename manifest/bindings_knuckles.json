@@ -1,0 +1,30 @@
+{
+  "alias_info": {},
+  "bindings": {
+    "/actions/main": {
+      "sources": [
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/a"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/a"
+        }
+      ]
+    }
+  },
+  "controller_type": "knuckles",
+  "description": "Default NexaShift Space Drag bindings for Valve Index Controllers",
+  "name": "NexaShift Knuckles Default"
+}

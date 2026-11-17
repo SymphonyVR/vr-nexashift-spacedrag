@@ -1,0 +1,30 @@
+{
+  "alias_info": {},
+  "bindings": {
+    "/actions/main": {
+      "sources": [
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/grip"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/grip"
+        }
+      ]
+    }
+  },
+  "controller_type": "holographic_controller",
+  "description": "Default NexaShift Space Drag bindings for Windows Mixed Reality Controllers",
+  "name": "NexaShift WMR Controller Default"
+}
