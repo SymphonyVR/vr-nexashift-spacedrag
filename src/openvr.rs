@@ -25,6 +25,9 @@ pub const VR_EVENT_CHAPERONE_UNIVERSE_HAS_CHANGED: u32 = 801;
 pub const VR_EVENT_CHAPERONE_TEMP_DATA_HAS_CHANGED: u32 = 802;
 pub const VR_EVENT_CHAPERONE_ROOM_SETUP_COMMITTED: u32 = 805;
 pub const VR_EVENT_STANDING_ZERO_POSE_RESET: u32 = 808;
+pub const VR_EVENT_INPUT_BINDING_LOAD_SUCCESSFUL: u32 = 1702;
+pub const VR_EVENT_INPUT_ACTION_MANIFEST_RELOADED: u32 = 1703;
+pub const VR_EVENT_INPUT_BINDINGS_UPDATED: u32 = 1707;
 pub const E_CHAPERONE_CONFIG_FILE_LIVE: i32 = 1;
 pub const K_N_ACTION_SET_OVERLAY_GLOBAL_PRIORITY_MAX: i32 = 0x01FF_FFFF;
 
@@ -322,6 +325,7 @@ pub struct OpenVrSession {
     hmd_refresh_hz: f32,
     working_set_synced: Cell<bool>,
     dirty_uncommitted: Cell<bool>,
+    bindings_dirty: Cell<bool>,
 }
 
 impl OpenVrSession {
@@ -500,7 +504,17 @@ impl OpenVrSession {
             hmd_refresh_hz,
             working_set_synced: Cell::new(false),
             dirty_uncommitted: Cell::new(false),
+            bindings_dirty: Cell::new(false),
         })
+    }
+
+    #[inline]
+    pub fn take_bindings_dirty(&self) -> bool {
+        let dirty = self.bindings_dirty.get();
+        if dirty {
+            self.bindings_dirty.set(false);
+        }
+        dirty
     }
 
     #[inline]
@@ -539,6 +553,11 @@ impl OpenVrSession {
                             self.working_set_synced.set(false);
                         }
                     }
+                    VR_EVENT_INPUT_BINDING_LOAD_SUCCESSFUL
+                    | VR_EVENT_INPUT_ACTION_MANIFEST_RELOADED
+                    | VR_EVENT_INPUT_BINDINGS_UPDATED => {
+                        self.bindings_dirty.set(true);
+                    }
                     _ => {}
                 }
             }
@@ -546,7 +565,12 @@ impl OpenVrSession {
         should_quit
     }
 
-    pub fn sample_inputs(&self, active_device_hint: Option<(Hand, u32)>) -> InputFrame {
+    pub fn sample_inputs(
+        &self,
+        active_device_hint: Option<(Hand, u32)>,
+        mut monitor: Option<&mut BareMetalInputMonitor>,
+        now_ns: u64,
+    ) -> InputFrame {
         let mut active_set = VRActiveActionSet_t {
             ul_action_set: self.action_set_main,
             ul_restricted_to_device: 0,
@@ -561,40 +585,66 @@ impl OpenVrSession {
                 1,
             )
         };
-        if err != VR_INPUT_ERROR_NONE {
-            return InputFrame::IDLE;
-        }
 
         let mut left_data = InputDigitalActionData_t::default();
         let mut right_data = InputDigitalActionData_t::default();
         let data_size = size_of::<InputDigitalActionData_t>() as u32;
-
-        let left_err = unsafe {
-            ((*self.vr_input).get_digital_action_data)(
-                self.action_space_drag,
-                &mut left_data,
-                data_size,
-                self.source_left,
-            )
+        let (left_err, right_err) = if err == VR_INPUT_ERROR_NONE {
+            let l = unsafe {
+                ((*self.vr_input).get_digital_action_data)(
+                    self.action_space_drag,
+                    &mut left_data,
+                    data_size,
+                    self.source_left,
+                )
+            };
+            let r = unsafe {
+                ((*self.vr_input).get_digital_action_data)(
+                    self.action_space_drag,
+                    &mut right_data,
+                    data_size,
+                    self.source_right,
+                )
+            };
+            (l, r)
+        } else {
+            (-1, -1)
         };
-        let right_err = unsafe {
-            ((*self.vr_input).get_digital_action_data)(
-                self.action_space_drag,
-                &mut right_data,
-                data_size,
-                self.source_right,
-            )
+
+        let left_ov = err == VR_INPUT_ERROR_NONE && left_err == VR_INPUT_ERROR_NONE && left_data.b_active;
+        let right_ov =
+            err == VR_INPUT_ERROR_NONE && right_err == VR_INPUT_ERROR_NONE && right_data.b_active;
+
+        let eval_side = |hand: Hand,
+                         ov_active: bool,
+                         ov_data: &InputDigitalActionData_t,
+                         mon: &mut Option<&mut BareMetalInputMonitor>|
+         -> (bool, Option<u32>) {
+            if ov_active {
+                if let Some(m) = mon.as_deref_mut() {
+                    m.sync_hand_detectors(hand, now_ns);
+                }
+                (ov_data.b_state, None)
+            } else if let Some(m) = mon.as_deref_mut() {
+                // Dashboard / focus suppression fallback: read the bound hardware components directly from SHM.
+                match m.eval_hand_from_shm(hand, now_ns) {
+                    Some((pressed, dev)) => (pressed, Some(dev)),
+                    None => (false, None),
+                }
+            } else {
+                (false, None)
+            }
         };
 
-        let left_pressed = left_err == VR_INPUT_ERROR_NONE && left_data.b_active && left_data.b_state;
-        let right_pressed =
-            right_err == VR_INPUT_ERROR_NONE && right_data.b_active && right_data.b_state;
+        let (left_pressed, left_shm_dev) = eval_side(Hand::Left, left_ov, &left_data, &mut monitor);
+        let (right_pressed, right_shm_dev) =
+            eval_side(Hand::Right, right_ov, &right_data, &mut monitor);
 
         // Idle fast path: skip all device pose queries when neither trigger is held or changed.
         if !left_pressed
             && !right_pressed
-            && !left_data.b_changed
-            && !right_data.b_changed
+            && !(left_ov && left_data.b_changed)
+            && !(right_ov && right_data.b_changed)
             && active_device_hint.is_none()
         {
             return InputFrame::IDLE;
@@ -615,6 +665,7 @@ impl OpenVrSession {
             Hand::Left,
             left_pressed,
             left_data.active_origin,
+            left_shm_dev,
             active_device_hint,
             &poses,
         );
@@ -622,6 +673,7 @@ impl OpenVrSession {
             Hand::Right,
             right_pressed,
             right_data.active_origin,
+            right_shm_dev,
             active_device_hint,
             &poses,
         );
@@ -634,6 +686,7 @@ impl OpenVrSession {
         hand: Hand,
         pressed: bool,
         active_origin: u64,
+        shm_dev: Option<u32>,
         active_device_hint: Option<(Hand, u32)>,
         poses: &[TrackedDevicePose_t; K_UN_MAX_TRACKED_DEVICE_COUNT],
     ) -> HandInput {
@@ -643,7 +696,10 @@ impl OpenVrSession {
 
         let device_index = match active_device_hint {
             Some((active_hand, idx)) if active_hand == hand => idx,
-            _ => self.resolve_device_index(hand, active_origin),
+            _ => match shm_dev {
+                Some(idx) if (idx as usize) < K_UN_MAX_TRACKED_DEVICE_COUNT => idx,
+                _ => self.resolve_device_index(hand, active_origin),
+            },
         };
 
         if (device_index as usize) >= K_UN_MAX_TRACKED_DEVICE_COUNT {
@@ -833,8 +889,10 @@ impl OpenVrSession {
             total_slots: 0,
             prev_vals: [0; MAX_TOTAL_SLOTS],
             curr_vals: [0; MAX_TOTAL_SLOTS],
+            bound_slots: [None; MAX_BOUND_SLOTS],
+            bound_count: 0,
         };
-        if !monitor.rebuild_containers_and_seed() {
+        if !monitor.rebuild_for_session(self) {
             return None;
         }
         Some(monitor)
@@ -849,9 +907,76 @@ const SHM_CONN_SEQ_OFFSET: usize = 0x408;
 const MAX_WATCHED_CONTAINERS: usize = 8;
 const MAX_SLOTS_PER_CONTAINER: usize = 32;
 const MAX_TOTAL_SLOTS: usize = 128;
+const MAX_BOUND_SLOTS: usize = 16;
 const PROP_TYPE_INPUT_COMPONENT: u32 = 0x21;
 const PROP_TABLE_ENTRY_BYTES: usize = 28;
 const POST_EDGE_GRACE_NS: u64 = 750_000_000;
+const DOUBLE_CLICK_WINDOW_NS: u64 = 500_000_000;
+const SHM_ANALOG_CLICK_THRESHOLD: f32 = 0.65;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TriggerKind {
+    Direct,
+    Double,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DoubleClickDetector {
+    prev_raw: bool,
+    awaiting_second: bool,
+    latched_double: bool,
+    last_first_press_ns: u64,
+}
+
+impl DoubleClickDetector {
+    #[inline]
+    fn step(&mut self, raw: bool, now_ns: u64) -> bool {
+        if raw && !self.prev_raw {
+            if self.awaiting_second
+                && now_ns.saturating_sub(self.last_first_press_ns) <= DOUBLE_CLICK_WINDOW_NS
+            {
+                self.latched_double = true;
+                self.awaiting_second = false;
+            } else {
+                self.last_first_press_ns = now_ns;
+                self.awaiting_second = false;
+            }
+        } else if !raw && self.prev_raw {
+            if self.latched_double {
+                self.latched_double = false;
+                self.awaiting_second = false;
+            } else if now_ns.saturating_sub(self.last_first_press_ns) <= DOUBLE_CLICK_WINDOW_NS {
+                self.awaiting_second = true;
+            }
+        } else if !raw
+            && self.awaiting_second
+            && now_ns.saturating_sub(self.last_first_press_ns) > DOUBLE_CLICK_WINDOW_NS
+        {
+            self.awaiting_second = false;
+        }
+        self.prev_raw = raw;
+        self.latched_double && raw
+    }
+
+    #[inline]
+    fn sync_inactive(&mut self, raw: bool) {
+        self.prev_raw = raw;
+        if !raw {
+            self.latched_double = false;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoundShmSlot {
+    hand: Hand,
+    dev_idx: u32,
+    container_idx: usize,
+    storage_off: usize,
+    ctype: u32,
+    kind: TriggerKind,
+    detector: DoubleClickDetector,
+}
 
 #[inline]
 fn cstr_slice(buf: &[u8]) -> &[u8] {
@@ -862,8 +987,62 @@ fn cstr_slice(buf: &[u8]) -> &[u8] {
     &buf[..len]
 }
 
+fn parse_hand(dev_path: &[u8]) -> Option<Hand> {
+    if dev_path == b"/user/hand/left" {
+        Some(Hand::Left)
+    } else if dev_path == b"/user/hand/right" {
+        Some(Hand::Right)
+    } else {
+        None
+    }
+}
+
+fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
+    haystack.len() >= suffix.len() && &haystack[haystack.len() - suffix.len()..] == suffix
+}
+
+/// Resolves an OpenVR binding entry (`dev`, `inp`, `slot`) into its NUL-terminated component path,
+/// optional analog fallback path (`/value`), hand, and trigger kind.
+fn resolve_binding_component_path(
+    dev: &[u8],
+    inp: &[u8],
+    slot: &[u8],
+    primary: &mut StackBuf<256>,
+    fallback: &mut StackBuf<256>,
+) -> Option<(Hand, TriggerKind, bool)> {
+    let hand = parse_hand(dev)?;
+    let (kind, suffix) = match slot {
+        b"double" => (TriggerKind::Double, b"/click".as_slice()),
+        b"touch" => (TriggerKind::Direct, b"/touch".as_slice()),
+        b"pull" | b"force" | b"value" => (TriggerKind::Direct, b"/value".as_slice()),
+        _ => (TriggerKind::Direct, b"/click".as_slice()),
+    };
+
+    let mut ok = primary.push_bytes(dev) && primary.push_bytes(inp);
+    let already_has_component =
+        ends_with(inp, b"/click") || ends_with(inp, b"/touch") || ends_with(inp, b"/value");
+    if !already_has_component {
+        ok = ok && primary.push_bytes(suffix);
+    }
+    if !(ok && primary.push_cstr_end()) {
+        return None;
+    }
+
+    let mut has_value_fallback = !already_has_component && suffix == b"/click";
+    if has_value_fallback {
+        has_value_fallback = fallback.push_bytes(dev)
+            && fallback.push_bytes(inp)
+            && fallback.push_bytes(b"/value")
+            && fallback.push_cstr_end();
+    }
+
+    Some((hand, kind, has_value_fallback))
+}
+
 struct WatchedContainer {
+    dev_idx: u32,
     hdr_shm: MappedReadOnlyShm,
+    tbl_shm: MappedReadOnlyShm,
     storage_shm: MappedReadOnlyShm,
     prop_count: u32,
     storage_sz: u32,
@@ -875,7 +1054,8 @@ struct WatchedContainer {
 ///
 /// Maps each connected controller's `PC_<container>_storage0` read-only and samples only the live
 /// input component value fields (`+0x18`) with `fearless_simd`, avoiding `VR_InputMutex` syscalls
-/// and `vrclient_x64.dll` per-frame heap allocations while idle.
+/// and `vrclient_x64.dll` per-frame heap allocations while idle, and providing unsuppressed input
+/// reading when the SteamVR Dashboard is open.
 pub struct BareMetalInputMonitor {
     server_pid: u32,
     server_wait_handle: Option<ProcessWaitHandle>,
@@ -891,6 +1071,8 @@ pub struct BareMetalInputMonitor {
     total_slots: usize,
     prev_vals: [u32; MAX_TOTAL_SLOTS],
     curr_vals: [u32; MAX_TOTAL_SLOTS],
+    bound_slots: [Option<BoundShmSlot>; MAX_BOUND_SLOTS],
+    bound_count: usize,
 }
 
 impl BareMetalInputMonitor {
@@ -905,11 +1087,147 @@ impl BareMetalInputMonitor {
     }
 
     #[inline]
+    pub fn watched_bound_count(&self) -> usize {
+        self.bound_count
+    }
+
+    #[inline]
     pub fn extend_grace(&mut self, now_ns: u64) {
         self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
     }
 
-    pub fn rebuild_containers_and_seed(&mut self) -> bool {
+    fn lookup_vr_input_state(&self, c1: u32, handle: u64) -> Option<(u32, u32, u32)> {
+        if handle == 0 {
+            return None;
+        }
+        let target_lo = handle as u32;
+        let target_hi = (handle >> 32) as u32;
+        let mut i = 0usize;
+        while i < (c1 as usize) {
+            let entry_off = i * SHM_COMPONENT_BYTES;
+            let lo = self.input_state_shm.read_volatile_u32(entry_off + 0x10)?;
+            let hi = self.input_state_shm.read_volatile_u32(entry_off + 0x14)?;
+            if lo == target_lo && hi == target_hi {
+                let ctype = self.input_state_shm.read_volatile_u32(entry_off)?;
+                let dev_idx = self.input_state_shm.read_volatile_u32(entry_off + 0x20)?;
+                let prop_lo = self.input_state_shm.read_volatile_u32(entry_off + 0x30)?;
+                return Some((ctype, dev_idx, 0x1000_0000u32 | prop_lo));
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn lookup_container_prop(&self, dev_idx: u32, prop_id: u32) -> Option<(usize, usize)> {
+        let mut cidx = 0usize;
+        while cidx < self.containers.len() {
+            if let Some(ref c) = self.containers[cidx] {
+                if c.dev_idx == dev_idx {
+                    let mut p = 0usize;
+                    while p < (c.prop_count as usize) {
+                        let toff = p * PROP_TABLE_ENTRY_BYTES;
+                        let prop = c.tbl_shm.read_volatile_u32(toff)?;
+                        let ptype = c.tbl_shm.read_volatile_u32(toff + 8)?;
+                        let soff = c.tbl_shm.read_volatile_u32(toff + 16)?;
+                        let slen = c.tbl_shm.read_volatile_u32(toff + 20)?;
+                        if prop == prop_id
+                            && ptype == PROP_TYPE_INPUT_COMPONENT
+                            && (slen as usize) == SHM_COMPONENT_BYTES
+                            && (soff as usize) + SHM_COMPONENT_BYTES <= (c.storage_sz as usize)
+                        {
+                            return Some((cidx, soff as usize));
+                        }
+                        p += 1;
+                    }
+                    return None;
+                }
+            }
+            cidx += 1;
+        }
+        None
+    }
+
+    fn resolve_bound_slots(&mut self, c1: u32, session: &OpenVrSession) {
+        self.bound_slots = [None; MAX_BOUND_SLOTS];
+        self.bound_count = 0;
+        if session.action_space_drag == 0 {
+            return;
+        }
+        let mut infos = [InputBindingInfo_t::default(); MAX_BOUND_SLOTS];
+        let mut count = 0u32;
+        let err = unsafe {
+            ((*session.vr_input).get_action_binding_info)(
+                session.action_space_drag,
+                infos.as_mut_ptr(),
+                size_of::<InputBindingInfo_t>() as u32,
+                infos.len() as u32,
+                &mut count,
+            )
+        };
+        if err != VR_INPUT_ERROR_NONE || count == 0 {
+            return;
+        }
+
+        let n = (count as usize).min(infos.len());
+        let mut i = 0usize;
+        while i < n && self.bound_count < MAX_BOUND_SLOTS {
+            let dev = cstr_slice(&infos[i].rch_device_path_name);
+            let inp = cstr_slice(&infos[i].rch_input_path_name);
+            let slot = cstr_slice(&infos[i].rch_slot_name);
+            let mut primary = StackBuf::<256>::new();
+            let mut fallback = StackBuf::<256>::new();
+            if let Some((hand, kind, has_fallback)) =
+                resolve_binding_component_path(dev, inp, slot, &mut primary, &mut fallback)
+            {
+                let mut h = 0u64;
+                let mut found = if unsafe {
+                    ((*session.vr_input).get_input_source_handle)(
+                        primary.as_bytes().as_ptr(),
+                        &mut h,
+                    )
+                } == VR_INPUT_ERROR_NONE
+                {
+                    self.lookup_vr_input_state(c1, h)
+                } else {
+                    None
+                };
+
+                if found.is_none() && has_fallback {
+                    let mut hf = 0u64;
+                    if unsafe {
+                        ((*session.vr_input).get_input_source_handle)(
+                            fallback.as_bytes().as_ptr(),
+                            &mut hf,
+                        )
+                    } == VR_INPUT_ERROR_NONE
+                    {
+                        found = self.lookup_vr_input_state(c1, hf);
+                    }
+                }
+
+                if let Some((ctype, dev_idx, prop_id)) = found {
+                    if (ctype == 1 || ctype == 2)
+                        && let Some((container_idx, storage_off)) =
+                            self.lookup_container_prop(dev_idx, prop_id)
+                    {
+                        self.bound_slots[self.bound_count] = Some(BoundShmSlot {
+                            hand,
+                            dev_idx,
+                            container_idx,
+                            storage_off,
+                            ctype,
+                            kind,
+                            detector: DoubleClickDetector::default(),
+                        });
+                        self.bound_count += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    pub fn rebuild_for_session(&mut self, session: &OpenVrSession) -> bool {
         let Some(conn_seq) = self.conn_state_shm.read_volatile_u64(SHM_CONN_SEQ_OFFSET) else {
             self.shm_valid = false;
             return false;
@@ -969,11 +1287,11 @@ impl BareMetalInputMonitor {
         let mut container_idx = 0usize;
         let mut d = 0usize;
         while d < dev_count {
-            let cid = 0x1_0000_0000u64 + (devs[d] as u64);
+            let dev_idx = devs[d];
+            let cid = 0x1_0000_0000u64 + (dev_idx as u64);
             let Some((hdr_shm, tbl_shm, sto_shm)) =
                 open_property_container_shm(self.server_pid, cid)
             else {
-                // Controller device listed in VR_InputState without readable PC SHM: fall back safely.
                 self.shm_valid = false;
                 return false;
             };
@@ -985,56 +1303,93 @@ impl BareMetalInputMonitor {
                 self.shm_valid = false;
                 return false;
             };
-
-            let mut container = WatchedContainer {
+            self.containers[container_idx] = Some(WatchedContainer {
+                dev_idx,
                 hdr_shm,
+                tbl_shm,
                 storage_shm: sto_shm,
                 prop_count,
                 storage_sz,
                 slot_count: 0,
                 slots: [(0, 0); MAX_SLOTS_PER_CONTAINER],
-            };
+            });
+            container_idx += 1;
+            d += 1;
+        }
 
-            let mut p = 0usize;
-            while p < (prop_count as usize) {
-                let toff = p * PROP_TABLE_ENTRY_BYTES;
-                let Some(ptype) = tbl_shm.read_volatile_u32(toff + 8) else {
-                    break;
-                };
-                let Some(soff) = tbl_shm.read_volatile_u32(toff + 16) else {
-                    break;
-                };
-                let Some(slen) = tbl_shm.read_volatile_u32(toff + 20) else {
-                    break;
-                };
-                if ptype == PROP_TYPE_INPUT_COMPONENT
-                    && (slen as usize) == SHM_COMPONENT_BYTES
-                    && (soff as usize) + SHM_COMPONENT_BYTES <= (storage_sz as usize)
-                {
-                    let Some(ctype) = container.storage_shm.read_volatile_u32(soff as usize + 0x10)
-                    else {
-                        break;
-                    };
-                    if ctype >= 1 && ctype <= self.max_watched_component_type.min(2) {
-                        if container.slot_count < MAX_SLOTS_PER_CONTAINER
+        self.resolve_bound_slots(c1, session);
+
+        if self.bound_count > 0 {
+            let mut b = 0usize;
+            while b < self.bound_count {
+                if let Some(bs) = self.bound_slots[b] {
+                    if let Some(ref mut c) = self.containers[bs.container_idx] {
+                        let mut dup = false;
+                        let mut k = 0usize;
+                        while k < c.slot_count {
+                            if c.slots[k].0 == bs.storage_off {
+                                dup = true;
+                                break;
+                            }
+                            k += 1;
+                        }
+                        if !dup
+                            && c.slot_count < MAX_SLOTS_PER_CONTAINER
                             && self.total_slots < MAX_TOTAL_SLOTS
                         {
-                            container.slots[container.slot_count] = (soff as usize, ctype);
-                            container.slot_count += 1;
+                            c.slots[c.slot_count] = (bs.storage_off, bs.ctype);
+                            c.slot_count += 1;
                             self.total_slots += 1;
                         }
                     }
                 }
-                p += 1;
+                b += 1;
             }
-
-            if container.slot_count == 0 {
-                self.shm_valid = false;
-                return false;
+        } else {
+            let mut cidx = 0usize;
+            while cidx < container_idx {
+                if let Some(ref mut container) = self.containers[cidx] {
+                    let mut p = 0usize;
+                    while p < (container.prop_count as usize) {
+                        let toff = p * PROP_TABLE_ENTRY_BYTES;
+                        let Some(ptype) = container.tbl_shm.read_volatile_u32(toff + 8) else {
+                            break;
+                        };
+                        let Some(soff) = container.tbl_shm.read_volatile_u32(toff + 16) else {
+                            break;
+                        };
+                        let Some(slen) = container.tbl_shm.read_volatile_u32(toff + 20) else {
+                            break;
+                        };
+                        if ptype == PROP_TYPE_INPUT_COMPONENT
+                            && (slen as usize) == SHM_COMPONENT_BYTES
+                            && (soff as usize) + SHM_COMPONENT_BYTES
+                                <= (container.storage_sz as usize)
+                        {
+                            let Some(ctype) =
+                                container.storage_shm.read_volatile_u32(soff as usize + 0x10)
+                            else {
+                                break;
+                            };
+                            if ctype >= 1 && ctype <= self.max_watched_component_type.min(2) {
+                                if container.slot_count < MAX_SLOTS_PER_CONTAINER
+                                    && self.total_slots < MAX_TOTAL_SLOTS
+                                {
+                                    container.slots[container.slot_count] = (soff as usize, ctype);
+                                    container.slot_count += 1;
+                                    self.total_slots += 1;
+                                }
+                            }
+                        }
+                        p += 1;
+                    }
+                    if container.slot_count == 0 {
+                        self.shm_valid = false;
+                        return false;
+                    }
+                }
+                cidx += 1;
             }
-            self.containers[container_idx] = Some(container);
-            container_idx += 1;
-            d += 1;
         }
 
         self.last_conn_seq = conn_seq;
@@ -1046,6 +1401,75 @@ impl BareMetalInputMonitor {
         }
         self.shm_valid = true;
         true
+    }
+
+    #[inline]
+    fn read_raw_bool(sto: &MappedReadOnlyShm, off: usize, ctype: u32) -> Option<bool> {
+        if ctype == 1 {
+            Some(sto.read_volatile_u8(off + 0x18)? != 0)
+        } else {
+            let raw = sto.read_volatile_u32(off + 0x18)?;
+            let f = f32::from_bits(raw);
+            Some(f.is_finite() && f >= SHM_ANALOG_CLICK_THRESHOLD)
+        }
+    }
+
+    pub fn sync_hand_detectors(&mut self, hand: Hand, _now_ns: u64) {
+        let mut b = 0usize;
+        while b < self.bound_count {
+            if let Some(mut bs) = self.bound_slots[b] {
+                if bs.hand == hand {
+                    if let Some(ref c) = self.containers[bs.container_idx] {
+                        if let Some(raw) = Self::read_raw_bool(&c.storage_shm, bs.storage_off, bs.ctype)
+                        {
+                            bs.detector.sync_inactive(raw);
+                            self.bound_slots[b] = Some(bs);
+                        }
+                    }
+                }
+            }
+            b += 1;
+        }
+    }
+
+    pub fn eval_hand_from_shm(&mut self, hand: Hand, now_ns: u64) -> Option<(bool, u32)> {
+        if !self.shm_valid || self.bound_count == 0 {
+            return None;
+        }
+        let mut any_bound_for_hand = false;
+        let mut any_pressed = false;
+        let mut dev_idx = u32::MAX;
+        let mut b = 0usize;
+        while b < self.bound_count {
+            if let Some(mut bs) = self.bound_slots[b] {
+                if bs.hand == hand {
+                    any_bound_for_hand = true;
+                    let c = self.containers[bs.container_idx].as_ref()?;
+                    let raw = Self::read_raw_bool(&c.storage_shm, bs.storage_off, bs.ctype)?;
+                    let pressed = match bs.kind {
+                        TriggerKind::Direct => {
+                            bs.detector.sync_inactive(raw);
+                            raw
+                        }
+                        TriggerKind::Double => bs.detector.step(raw, now_ns),
+                    };
+                    self.bound_slots[b] = Some(bs);
+                    if dev_idx == u32::MAX {
+                        dev_idx = bs.dev_idx;
+                    }
+                    if pressed {
+                        any_pressed = true;
+                        dev_idx = bs.dev_idx;
+                    }
+                }
+            }
+            b += 1;
+        }
+        if any_bound_for_hand && dev_idx != u32::MAX {
+            Some((any_pressed, dev_idx))
+        } else {
+            None
+        }
     }
 
     fn read_slot_value(sto: &MappedReadOnlyShm, off: usize, ctype: u32) -> Option<u32> {
@@ -1207,5 +1631,53 @@ mod tests {
             core::mem::offset_of!(VR_IVROverlay_FnTable, wait_frame_sync),
             47 * size_of::<*const c_void>()
         );
+    }
+
+    #[test]
+    fn double_click_detector_latches_within_window_and_rejects_single_or_slow_clicks() {
+        let mut d = DoubleClickDetector::default();
+        // Single press + release should not activate.
+        assert!(!d.step(true, 100_000_000));
+        assert!(!d.step(false, 150_000_000));
+        // Second press within 500 ms of first press latches until release.
+        assert!(d.step(true, 300_000_000));
+        assert!(d.step(true, 320_000_000));
+        assert!(!d.step(false, 900_000_000));
+
+        // Slow second press after window expires should NOT latch.
+        assert!(!d.step(true, 2_000_000_000));
+        assert!(!d.step(false, 2_100_000_000));
+        assert!(!d.step(true, 2_700_000_000));
+        assert!(!d.step(false, 2_800_000_000));
+    }
+
+    #[test]
+    fn resolve_binding_component_path_maps_hand_mode_slot_and_avoids_duplicate_suffix() {
+        let mut p = StackBuf::<256>::new();
+        let mut fb = StackBuf::<256>::new();
+        let res = resolve_binding_component_path(
+            b"/user/hand/left",
+            b"/input/joystick",
+            b"click",
+            &mut p,
+            &mut fb,
+        )
+        .unwrap();
+        assert_eq!(res, (Hand::Left, TriggerKind::Direct, true));
+        assert_eq!(p.as_bytes(), b"/user/hand/left/input/joystick/click\0");
+        assert_eq!(fb.as_bytes(), b"/user/hand/left/input/joystick/value\0");
+
+        let mut p2 = StackBuf::<256>::new();
+        let mut fb2 = StackBuf::<256>::new();
+        let res2 = resolve_binding_component_path(
+            b"/user/hand/right",
+            b"/input/b/click",
+            b"double",
+            &mut p2,
+            &mut fb2,
+        )
+        .unwrap();
+        assert_eq!(res2, (Hand::Right, TriggerKind::Double, false));
+        assert_eq!(p2.as_bytes(), b"/user/hand/right/input/b/click\0");
     }
 }

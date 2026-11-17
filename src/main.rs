@@ -218,16 +218,17 @@ fn run_bench(simd: SimdMath) -> i32 {
         }
     };
 
-    let _ = session.sample_inputs(None);
+    let _ = session.sample_inputs(None, None, 0);
     let mut monitor = session.open_bare_metal_monitor();
     let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
 
     print_out(format_args!(
-        "bench[init]: simd={}, hmd_hz={}, shm={}, shm_slots={}, idle_period_ms={}\n",
+        "bench[init]: simd={}, hmd_hz={}, shm={}, shm_slots={}, bound_slots={}, idle_period_ms={}\n",
         simd.level_name(),
         session.hmd_refresh_hz() as u32,
         monitor.is_some(),
         monitor.as_ref().map_or(0, |m| m.watched_slot_count()),
+        monitor.as_ref().map_or(0, |m| m.watched_bound_count()),
         idle_period_ms
     ));
 
@@ -260,14 +261,15 @@ fn run_bench(simd: SimdMath) -> i32 {
             Some(m) => m.poll_should_sample(simd, now_ns),
             None => (true, false),
         };
-        if should_sample {
-            let frame = session.sample_inputs(sm.active_device_hint());
+        let event_bindings_dirty = session.take_bindings_dirty();
+        if should_sample || event_bindings_dirty {
+            let frame = session.sample_inputs(sm.active_device_hint(), monitor.as_mut(), now_ns);
             let _ = sm.step_with(frame, || session.get_working_standing_pose());
-            if bindings_changed {
+            if bindings_changed || event_bindings_dirty {
                 let mut drop_monitor = false;
                 if let Some(m) = monitor.as_mut() {
                     m.set_max_watched_component_type(session.space_drag_max_component_type());
-                    if !m.rebuild_containers_and_seed() {
+                    if !m.rebuild_for_session(&session) {
                         drop_monitor = true;
                     }
                 }
@@ -333,7 +335,7 @@ fn run_bench(simd: SimdMath) -> i32 {
             break;
         }
         let iter_t0 = clock.now_ns();
-        let _real_frame = session.sample_inputs(drag_sm.active_device_hint());
+        let _real_frame = session.sample_inputs(drag_sm.active_device_hint(), monitor.as_mut(), iter_t0);
         let phase = ((drag_wakeups % 120) as f32) / 120.0;
         let offset = if phase <= 0.5 {
             phase * 0.04
@@ -416,7 +418,7 @@ fn run_daemon(simd: SimdMath) -> i32 {
         }
     };
 
-    let _ = session.sample_inputs(None);
+    let _ = session.sample_inputs(None, None, 0);
     let mut monitor = session.open_bare_metal_monitor();
     let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
 
@@ -439,7 +441,8 @@ fn run_daemon(simd: SimdMath) -> i32 {
             }
             tick = tick.wrapping_add(1);
 
-            let frame = session.sample_inputs(sm.active_device_hint());
+            let now_ns = clock.now_ns();
+            let frame = session.sample_inputs(sm.active_device_hint(), monitor.as_mut(), now_ns);
             match sm.step_with(frame, || session.get_working_standing_pose()) {
                 StepAction::UpdatePlayspace(m) => {
                     last_drag_release_ns = None;
@@ -455,7 +458,7 @@ fn run_daemon(simd: SimdMath) -> i32 {
                 let mut drop_monitor = false;
                 if let Some(m) = monitor.as_mut() {
                     m.extend_grace(now_ns);
-                    if !m.rebuild_containers_and_seed() {
+                    if !m.rebuild_for_session(&session) {
                         drop_monitor = true;
                     }
                 }
@@ -481,7 +484,8 @@ fn run_daemon(simd: SimdMath) -> i32 {
             Some(m) => m.poll_should_sample(simd, now_ns),
             None => (true, false),
         };
-        if !should_sample {
+        let event_bindings_dirty = session.take_bindings_dirty();
+        if !should_sample && !event_bindings_dirty {
             if let Some(t_rel) = last_drag_release_ns {
                 if now_ns.saturating_sub(t_rel) >= 3_000_000_000 {
                     session.flush_pending_commit();
@@ -491,12 +495,12 @@ fn run_daemon(simd: SimdMath) -> i32 {
             continue;
         }
 
-        let frame = session.sample_inputs(sm.active_device_hint());
-        if bindings_changed {
+        let frame = session.sample_inputs(sm.active_device_hint(), monitor.as_mut(), now_ns);
+        if bindings_changed || event_bindings_dirty {
             let mut drop_monitor = false;
             if let Some(m) = monitor.as_mut() {
                 m.set_max_watched_component_type(session.space_drag_max_component_type());
-                if !m.rebuild_containers_and_seed() {
+                if !m.rebuild_for_session(&session) {
                     drop_monitor = true;
                 }
             }
