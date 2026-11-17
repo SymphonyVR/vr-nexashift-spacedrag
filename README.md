@@ -11,7 +11,7 @@ A headless `#![no_std]` Rust utility for 1:1 3D OpenVR / SteamVR playspace dragg
 - **0.0% Idle CPU with Native Frame Latency:**
   - Wakes at native HMD cadence (`8–12 ms`, clamped from `1000 / HMD_Hz`) using a high-resolution waitable timer (`CreateWaitableTimerExW(..., CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, ...)` on Windows) rather than coarse `15.625 ms` scheduler ticks.
   - Watches only the resolved bound input component slots in read-only shared memory with runtime-detected `fearless_simd` (e.g., AVX2 / SSE / NEON / scalar fallback), avoiding per-tick `VR_InputMutex` calls and `vrclient` heap allocations while idle.
-  - Switches to compositor frame synchronization (`IVROverlay::WaitFrameSync`) during active drags and debounces `CommitWorkingCopy` (`3s` after drag release or on shutdown) to avoid chaperone disk churn.
+  - Switches to compositor frame synchronization (`IVROverlay::WaitFrameSync`) during active drags and debounces `CommitWorkingCopy` (`3s` after drag release or on shutdown) so SteamVR isn't rewriting `chaperone_info.vrchap` on every drag or frame.
 - **Strictly `#![no_std]` Core:** Zero heap allocation (`no_std` / no `alloc`) in the binary and library.
 
 ## Default Bindings
