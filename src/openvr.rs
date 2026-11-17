@@ -223,6 +223,13 @@ pub struct VR_IVRInput_FnTable {
     pub get_binding_variant: *const c_void,
 }
 
+#[repr(C)]
+pub struct VR_IVROverlay_FnTable {
+    pub _before_wait_frame_sync: [*const c_void; 47],
+    pub wait_frame_sync: unsafe extern "system" fn(n_timeout_ms: u32) -> i32,
+    pub _after_wait_frame_sync: [*const c_void; 34],
+}
+
 type FnVrInitInternal = unsafe extern "C" fn(pe_error: *mut i32, e_type: i32) -> isize;
 type FnVrShutdownInternal = unsafe extern "C" fn();
 type FnVrGetGenericInterface =
@@ -244,6 +251,7 @@ pub struct OpenVrSession {
     vr_system: *const VR_IVRSystem_FnTable,
     chaperone_setup: *const VR_IVRChaperoneSetup_FnTable,
     vr_input: *const VR_IVRInput_FnTable,
+    vr_overlay: *const VR_IVROverlay_FnTable,
     action_set_main: u64,
     action_space_drag: u64,
     source_left: u64,
@@ -299,6 +307,8 @@ impl OpenVrSession {
         )? as *const VR_IVRChaperoneSetup_FnTable;
         let vr_input =
             get_table(b"FnTable:IVRInput_010\0", "IVRInput_010")? as *const VR_IVRInput_FnTable;
+        let vr_overlay = get_table(b"FnTable:IVROverlay_026\0", "IVROverlay_026")?
+            as *const VR_IVROverlay_FnTable;
 
         // Synchronize the working set once on startup without touching disk.
         unsafe {
@@ -396,12 +406,18 @@ impl OpenVrSession {
             vr_system,
             chaperone_setup,
             vr_input,
+            vr_overlay,
             action_set_main,
             action_space_drag,
             source_left,
             source_right,
             hmd_refresh_hz,
         })
+    }
+
+    #[inline]
+    pub fn wait_frame_sync(&self, timeout_ms: u32) -> bool {
+        unsafe { ((*self.vr_overlay).wait_frame_sync)(timeout_ms) == 0 }
     }
 
     #[inline]
@@ -474,8 +490,13 @@ impl OpenVrSession {
         let right_pressed =
             right_err == VR_INPUT_ERROR_NONE && right_data.b_active && right_data.b_state;
 
-        // Idle fast path: skip all device pose queries when neither trigger is held.
-        if !left_pressed && !right_pressed && active_device_hint.is_none() {
+        // Idle fast path: skip all device pose queries when neither trigger is held or changed.
+        if !left_pressed
+            && !right_pressed
+            && !left_data.b_changed
+            && !right_data.b_changed
+            && active_device_hint.is_none()
+        {
             return InputFrame::IDLE;
         }
 
@@ -629,5 +650,13 @@ mod tests {
         assert_eq!(size_of::<VREvent_t>(), 60);
         #[cfg(not(target_os = "linux"))]
         assert_eq!(size_of::<VREvent_t>(), 64);
+        assert_eq!(
+            size_of::<VR_IVROverlay_FnTable>(),
+            82 * size_of::<*const c_void>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(VR_IVROverlay_FnTable, wait_frame_sync),
+            47 * size_of::<*const c_void>()
+        );
     }
 }

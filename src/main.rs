@@ -3,30 +3,13 @@
 
 use core::fmt::Write;
 
-use nexashift::math::{HmdMatrix34_t, Vec3, apply_raw_translation};
+use nexashift::math::{HmdMatrix34_t, SimdMath, Vec3};
 use nexashift::openvr::{OpenVrError, OpenVrSession};
 use nexashift::platform::{
-    MonotonicClock, StackBuf, WaitTimer, command_line_has_flag, install_signal_handlers,
+    MonotonicClock, ReactiveWaiter, StackBuf, command_line_has_flag, install_signal_handlers,
     is_running, query_chaperone_file_stamp, query_process_stats, write_stderr, write_stdout,
 };
 use nexashift::state::{DragStateMachine, HandInput, InputFrame, StepAction};
-
-const IDLE_INTERVAL_NS: u64 = 16_666_667; // 60 Hz
-
-#[inline]
-fn pace_next_tick(
-    clock: &MonotonicClock,
-    timer: &WaitTimer,
-    next_deadline_ns: &mut u64,
-    interval_ns: u64,
-) {
-    let now = clock.now_ns();
-    *next_deadline_ns = next_deadline_ns.saturating_add(interval_ns);
-    if now >= *next_deadline_ns {
-        *next_deadline_ns = now.saturating_add(interval_ns);
-    }
-    timer.sleep_precise_ns(next_deadline_ns.saturating_sub(now));
-}
 
 #[cfg(all(not(test), target_os = "windows"))]
 #[link(name = "vcruntime")]
@@ -95,7 +78,16 @@ fn mat_translation_close(a: &HmdMatrix34_t, b: &HmdMatrix34_t, eps: f32) -> bool
     true
 }
 
-fn run_poc() -> i32 {
+#[inline]
+fn wait_next_vr_frame(session: &OpenVrSession, waiter: &ReactiveWaiter) {
+    if !session.wait_frame_sync(100) && is_running() {
+        waiter.wait_stop_or_timeout_ms(100);
+    }
+}
+
+fn run_poc(simd: SimdMath) -> i32 {
+    install_signal_handlers();
+
     let session = match OpenVrSession::init(true) {
         Ok(s) => s,
         Err(OpenVrError::ManifestNotFound | OpenVrError::InputInitFailed(_, _)) => {
@@ -122,28 +114,27 @@ fn run_poc() -> i32 {
 
     let t0 = m0.translation();
     print_out(format_args!(
-        "poc: connected (HMD target {} Hz), initial translation=({:.4}, {:.4}, {:.4})\n",
+        "poc: connected (HMD target {} Hz, simd={}), initial translation=({:.4}, {:.4}, {:.4})\n",
         session.hmd_refresh_hz() as u32,
+        simd.level_name(),
         t0.x,
         t0.y,
         t0.z
     ));
 
     let clock = MonotonicClock::new();
-    let timer = WaitTimer::new();
+    let waiter = ReactiveWaiter::new();
     let stats_before = query_process_stats();
     let chap_before = query_chaperone_file_stamp();
 
     let steps: u64 = 120;
-    let interval_ns: u64 = 8_333_333;
-    let mut next_deadline_ns = clock.now_ns();
     let mut min_ns = u64::MAX;
     let mut max_ns = 0u64;
     let mut sum_ns = 0u64;
     let mut verified_steps = 0u64;
 
     let mut i = 1u64;
-    while i <= steps {
+    while i <= steps && is_running() {
         let frac = (i as f32) / (steps as f32);
         // Smooth out-and-back excursion in all 3 axes (0 -> 0.05m -> 0m).
         let wave = if frac <= 0.5 {
@@ -152,7 +143,7 @@ fn run_poc() -> i32 {
             (1.0 - frac) * 2.0
         };
         let delta = Vec3::new(0.05 * wave, 0.03 * wave, -0.05 * wave);
-        let target = apply_raw_translation(&m0, delta);
+        let target = simd.apply_raw_translation(&m0, delta);
 
         let t_start = clock.now_ns();
         session.apply_working_standing_pose(&target);
@@ -172,7 +163,7 @@ fn run_poc() -> i32 {
             }
         }
 
-        pace_next_tick(&clock, &timer, &mut next_deadline_ns, interval_ns);
+        wait_next_vr_frame(&session, &waiter);
         i += 1;
     }
 
@@ -207,7 +198,9 @@ fn run_poc() -> i32 {
     }
 }
 
-fn run_bench() -> i32 {
+fn run_bench(simd: SimdMath) -> i32 {
+    install_signal_handlers();
+
     let session = match OpenVrSession::init(true) {
         Ok(s) => s,
         Err(e) => {
@@ -216,26 +209,31 @@ fn run_bench() -> i32 {
         }
     };
 
-    let clock = MonotonicClock::new();
-    let timer = WaitTimer::new();
-    let mut sm = DragStateMachine::new();
+    print_out(format_args!(
+        "bench[init]: simd={}, hmd_hz={}\n",
+        simd.level_name(),
+        session.hmd_refresh_hz() as u32
+    ));
 
-    // 1. Idle 60 Hz benchmark (5 seconds).
+    let clock = MonotonicClock::new();
+    let waiter = ReactiveWaiter::new();
+    let mut sm = DragStateMachine::with_simd(simd);
+
+    // 1. Reactive Idle benchmark (5 seconds synchronized by WaitFrameSync).
     let bench_duration_ns: u64 = 5_000_000_000;
     let idle_chap_before = query_chaperone_file_stamp();
     let idle_start_stats = query_process_stats();
     let idle_t0 = clock.now_ns();
-    let mut idle_deadline = idle_t0;
     let mut idle_wakeups: u64 = 0;
 
-    while clock.now_ns().saturating_sub(idle_t0) < bench_duration_ns {
-        if session.poll_should_quit() {
+    while is_running() && clock.now_ns().saturating_sub(idle_t0) < bench_duration_ns {
+        wait_next_vr_frame(&session, &waiter);
+        if !is_running() || session.poll_should_quit() {
             break;
         }
         let frame = session.sample_inputs(sm.active_device_hint());
         let _ = sm.step_with(frame, || session.get_working_standing_pose());
         idle_wakeups += 1;
-        pace_next_tick(&clock, &timer, &mut idle_deadline, IDLE_INTERVAL_NS);
     }
 
     let idle_wall_ns = clock.now_ns().saturating_sub(idle_t0).max(1);
@@ -265,25 +263,24 @@ fn run_bench() -> i32 {
         idle_chap_modified
     ));
 
-    // 2. Dragging benchmark at HMD refresh rate (5 seconds).
+    // 2. Reactive Dragging benchmark (5 seconds synchronized by WaitFrameSync).
     let Some(m0) = session.get_working_standing_pose() else {
         print_err(format_args!("error: failed to read working standing pose\n"));
         return 1;
     };
 
-    let mut drag_sm = DragStateMachine::new();
-    let drag_interval = session.drag_interval_ns();
+    let mut drag_sm = DragStateMachine::with_simd(simd);
     let drag_chap_before = query_chaperone_file_stamp();
     let drag_start_stats = query_process_stats();
     let drag_t0 = clock.now_ns();
-    let mut drag_deadline = drag_t0;
     let mut drag_wakeups: u64 = 0;
     let mut lat_min_ns = u64::MAX;
     let mut lat_max_ns = 0u64;
     let mut lat_sum_ns = 0u64;
 
-    while clock.now_ns().saturating_sub(drag_t0) < bench_duration_ns {
-        if session.poll_should_quit() {
+    while is_running() && clock.now_ns().saturating_sub(drag_t0) < bench_duration_ns {
+        wait_next_vr_frame(&session, &waiter);
+        if !is_running() || session.poll_should_quit() {
             break;
         }
         let iter_t0 = clock.now_ns();
@@ -316,7 +313,6 @@ fn run_bench() -> i32 {
         lat_sum_ns = lat_sum_ns.saturating_add(iter_dt);
 
         drag_wakeups += 1;
-        pace_next_tick(&clock, &timer, &mut drag_deadline, drag_interval);
     }
 
     // Restore original M0 cleanly.
@@ -359,7 +355,7 @@ fn run_bench() -> i32 {
     0
 }
 
-fn run_daemon() -> i32 {
+fn run_daemon(simd: SimdMath) -> i32 {
     install_signal_handlers();
 
     let session = match OpenVrSession::init(true) {
@@ -370,15 +366,12 @@ fn run_daemon() -> i32 {
         }
     };
 
-    let clock = MonotonicClock::new();
-    let timer = WaitTimer::new();
-    let drag_interval_ns = session.drag_interval_ns();
-    let mut next_deadline_ns = clock.now_ns();
-    let mut sm = DragStateMachine::new();
-    let mut was_dragging = false;
+    let waiter = ReactiveWaiter::new();
+    let mut sm = DragStateMachine::with_simd(simd);
 
     while is_running() {
-        if session.poll_should_quit() {
+        wait_next_vr_frame(&session, &waiter);
+        if !is_running() || session.poll_should_quit() {
             break;
         }
 
@@ -388,38 +381,29 @@ fn run_daemon() -> i32 {
         {
             session.apply_working_standing_pose(&m);
         }
-
-        let is_dragging = sm.is_dragging();
-        if is_dragging != was_dragging {
-            next_deadline_ns = clock.now_ns();
-            was_dragging = is_dragging;
-        }
-        let interval = if is_dragging {
-            drag_interval_ns
-        } else {
-            IDLE_INTERVAL_NS
-        };
-        pace_next_tick(&clock, &timer, &mut next_deadline_ns, interval);
     }
 
     0
 }
 
 fn app_main() -> i32 {
+    let simd = SimdMath::new_detected();
+
     if command_line_has_flag(b"--help") || command_line_has_flag(b"-h") {
         print_out(format_args!(
-            "nexashift - headless 1:1 3D SteamVR playspace drag\n\
-             usage: nexashift [--poc | --bench | --help]\n"
+            "nexashift - headless reactive 1:1 3D SteamVR playspace drag (simd={})\n\
+             usage: nexashift [--poc | --bench | --help]\n",
+            simd.level_name()
         ));
         return 0;
     }
     if command_line_has_flag(b"--poc") {
-        return run_poc();
+        return run_poc(simd);
     }
     if command_line_has_flag(b"--bench") {
-        return run_bench();
+        return run_bench(simd);
     }
-    run_daemon()
+    run_daemon(simd)
 }
 
 #[cfg(not(test))]

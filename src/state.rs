@@ -1,4 +1,4 @@
-use crate::math::{HmdMatrix34_t, Vec3, apply_raw_translation};
+use crate::math::{HmdMatrix34_t, SimdMath, Vec3};
 
 pub const INVALID_DEVICE_INDEX: u32 = u32::MAX;
 
@@ -58,6 +58,7 @@ pub enum DragPhase {
         hand: Hand,
         device_index: u32,
         c0: Vec3,
+        last_raw: Vec3,
         m0: HmdMatrix34_t,
     },
 }
@@ -75,15 +76,21 @@ pub struct DragStateMachine {
     left_latched_ignore: bool,
     right_latched_ignore: bool,
     suspended_hand: Option<Hand>,
+    simd: SimdMath,
 }
 
 impl DragStateMachine {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_simd(SimdMath::new_detected())
+    }
+
+    pub const fn with_simd(simd: SimdMath) -> Self {
         Self {
             phase: DragPhase::Idle,
             left_latched_ignore: false,
             right_latched_ignore: false,
             suspended_hand: None,
+            simd,
         }
     }
 
@@ -148,6 +155,7 @@ impl DragStateMachine {
                 hand,
                 device_index,
                 c0,
+                last_raw,
                 m0,
             } => {
                 let other = Self::other_hand(hand);
@@ -167,8 +175,19 @@ impl DragStateMachine {
                     return StepAction::AbortDrag;
                 }
 
-                let delta = active.position_raw.sub(c0);
-                let m_new = apply_raw_translation(&m0, delta);
+                if active.position_raw == last_raw {
+                    return StepAction::Idle;
+                }
+
+                self.phase = DragPhase::Dragging {
+                    hand,
+                    device_index,
+                    c0,
+                    last_raw: active.position_raw,
+                    m0,
+                };
+                let delta = self.simd.sub_vec3(active.position_raw, c0);
+                let m_new = self.simd.apply_raw_translation(&m0, delta);
                 StepAction::UpdatePlayspace(m_new)
             }
             DragPhase::Idle => {
@@ -218,6 +237,7 @@ impl DragStateMachine {
                     hand,
                     device_index: input.device_index,
                     c0: input.position_raw,
+                    last_raw: input.position_raw,
                     m0,
                 };
                 StepAction::UpdatePlayspace(m0)
@@ -235,6 +255,7 @@ impl Default for DragStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::apply_raw_translation;
 
     fn hand(pressed: bool, id: u32, pos: (f32, f32, f32)) -> HandInput {
         HandInput {
@@ -469,5 +490,19 @@ mod tests {
             None,
         );
         assert_eq!(final_step, StepAction::UpdatePlayspace(m0));
+    }
+
+    #[test]
+    fn stationary_held_controller_skips_redundant_updates() {
+        let mut sm = DragStateMachine::new();
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let f = InputFrame {
+            left: hand(true, 1, (0.2, 1.0, -0.3)),
+            right: HandInput::UNPRESSED,
+        };
+        assert_eq!(sm.step(f, Some(m0)), StepAction::UpdatePlayspace(m0));
+        assert!(sm.is_dragging());
+        assert_eq!(sm.step(f, None), StepAction::Idle);
+        assert!(sm.is_dragging());
     }
 }

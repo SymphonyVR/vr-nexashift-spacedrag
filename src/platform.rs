@@ -12,6 +12,7 @@ pub fn is_running() -> bool {
 #[inline]
 pub fn request_stop() {
     RUNNING.store(false, Ordering::Release);
+    imp::signal_stop_event();
 }
 
 pub struct StackBuf<const N: usize> {
@@ -184,6 +185,8 @@ fn pop_path_component(path: &[u8]) -> &[u8] {
 mod imp {
     use super::*;
 
+    use core::sync::atomic::AtomicIsize;
+
     const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
     const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -194,9 +197,8 @@ mod imp {
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
     const INVALID_HANDLE_VALUE: isize = -1;
     const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
-    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
-    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
-    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -294,21 +296,13 @@ mod imp {
         fn FreeLibrary(hLibModule: isize) -> i32;
         fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> i32;
         fn QueryPerformanceFrequency(lpFrequency: *mut i64) -> i32;
-        fn Sleep(dwMilliseconds: u32);
-        fn CreateWaitableTimerExW(
-            lpTimerAttributes: *const c_void,
-            lpTimerName: *const u16,
-            dwFlags: u32,
-            dwDesiredAccess: u32,
+        fn CreateEventW(
+            lpEventAttributes: *const c_void,
+            bManualReset: i32,
+            bInitialState: i32,
+            lpName: *const u16,
         ) -> isize;
-        fn SetWaitableTimer(
-            hTimer: isize,
-            lpDueTime: *const i64,
-            lPeriod: i32,
-            pfnCompletionRoutine: *const c_void,
-            lpArgToCompletionRoutine: *const c_void,
-            fResume: i32,
-        ) -> i32;
+        fn SetEvent(hEvent: isize) -> i32;
         fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
         fn SetConsoleCtrlHandler(
             handlerRoutine: Option<unsafe extern "system" fn(u32) -> i32>,
@@ -411,73 +405,55 @@ mod imp {
         }
     }
 
-    pub struct WaitTimer {
-        handle: isize,
+    #[inline]
+    pub fn signal_stop_event() {
+        let h = STOP_EVENT.load(Ordering::Acquire);
+        if h != 0 {
+            unsafe {
+                let _ = SetEvent(h);
+            }
+        }
     }
 
-    impl WaitTimer {
+    pub struct ReactiveWaiter {
+        event_handle: isize,
+    }
+
+    impl ReactiveWaiter {
         pub fn new() -> Self {
-            let mut h = unsafe {
-                CreateWaitableTimerExW(
-                    core::ptr::null(),
-                    core::ptr::null(),
-                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                    TIMER_ALL_ACCESS,
-                )
-            };
-            if h == 0 {
-                // Fallback to standard waitable timer on pre-Windows 10 1803 systems.
-                h = unsafe {
-                    CreateWaitableTimerExW(
-                        core::ptr::null(),
-                        core::ptr::null(),
-                        0,
-                        TIMER_ALL_ACCESS,
-                    )
-                };
-            }
-            Self { handle: h }
-        }
-
-        #[inline]
-        pub fn sleep_idle_ms(&self, ms: u32) {
-            unsafe { Sleep(ms) };
-        }
-
-        #[inline]
-        pub fn sleep_precise_ns(&self, ns: u64) {
-            if ns == 0 {
-                return;
-            }
-            if self.handle != 0 {
-                let intervals = -((ns / 100).max(1) as i64);
-                let ok = unsafe {
-                    SetWaitableTimer(
-                        self.handle,
-                        &intervals,
-                        0,
-                        core::ptr::null(),
-                        core::ptr::null(),
-                        0,
-                    )
-                };
-                if ok != 0 {
+            let h = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
+            if h != 0 {
+                STOP_EVENT.store(h, Ordering::Release);
+                if !is_running() {
                     unsafe {
-                        let _ = WaitForSingleObject(self.handle, INFINITE);
+                        let _ = SetEvent(h);
                     }
-                    return;
                 }
             }
-            let ms = ((ns + 999_999) / 1_000_000).max(1) as u32;
-            unsafe { Sleep(ms) };
+            Self { event_handle: h }
+        }
+
+        #[inline]
+        pub fn wait_stop_or_timeout_ms(&self, timeout_ms: u32) {
+            if self.event_handle != 0 && is_running() {
+                unsafe {
+                    let _ = WaitForSingleObject(self.event_handle, timeout_ms);
+                }
+            }
         }
     }
 
-    impl Drop for WaitTimer {
+    impl Drop for ReactiveWaiter {
         fn drop(&mut self) {
-            if self.handle != 0 {
+            if self.event_handle != 0 {
+                let _ = STOP_EVENT.compare_exchange(
+                    self.event_handle,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 unsafe {
-                    let _ = CloseHandle(self.handle);
+                    let _ = CloseHandle(self.event_handle);
                 }
             }
         }
@@ -860,13 +836,19 @@ mod imp {
 mod imp {
     use super::*;
 
+    use core::sync::atomic::AtomicI32;
+
     const CLOCK_MONOTONIC: i32 = 1;
     const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
     const RTLD_NOW: i32 = 2;
     const F_OK: i32 = 0;
     const O_RDONLY: i32 = 0;
+    const O_NONBLOCK_CLOEXEC: i32 = 0x0008_0800;
+    const POLLIN: i16 = 1;
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
+
+    static STOP_PIPE_WR: AtomicI32 = AtomicI32::new(-1);
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -875,12 +857,21 @@ mod imp {
         tv_nsec: i64,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+
     #[link(name = "c")]
     unsafe extern "C" {
         fn write(fd: i32, buf: *const c_void, count: usize) -> isize;
         fn _exit(status: i32) -> !;
         fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
-        fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i32;
+        fn pipe2(pipefd: *mut i32, flags: i32) -> i32;
+        fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
         fn readlink(pathname: *const u8, buf: *mut u8, bufsiz: usize) -> isize;
         fn getcwd(buf: *mut u8, size: usize) -> *mut u8;
         fn getenv(name: *const u8) -> *const u8;
@@ -957,29 +948,74 @@ mod imp {
             .saturating_add(ts.tv_nsec as u64)
     }
 
-    pub struct WaitTimer;
-
-    impl WaitTimer {
-        pub fn new() -> Self {
-            Self
-        }
-
-        #[inline]
-        pub fn sleep_idle_ms(&self, ms: u32) {
-            self.sleep_precise_ns((ms as u64).saturating_mul(1_000_000));
-        }
-
-        #[inline]
-        pub fn sleep_precise_ns(&self, ns: u64) {
-            if ns == 0 {
-                return;
-            }
-            let req = Timespec {
-                tv_sec: (ns / 1_000_000_000) as i64,
-                tv_nsec: (ns % 1_000_000_000) as i64,
-            };
+    #[inline]
+    pub fn signal_stop_event() {
+        let fd = STOP_PIPE_WR.load(Ordering::Acquire);
+        if fd >= 0 {
+            let b = 1u8;
             unsafe {
-                let _ = nanosleep(&req, core::ptr::null_mut());
+                let _ = write(fd, (&b as *const u8).cast(), 1);
+            }
+        }
+    }
+
+    pub struct ReactiveWaiter {
+        read_fd: i32,
+        write_fd: i32,
+    }
+
+    impl ReactiveWaiter {
+        pub fn new() -> Self {
+            let mut fds = [-1i32; 2];
+            if unsafe { pipe2(fds.as_mut_ptr(), O_NONBLOCK_CLOEXEC) } == 0 {
+                STOP_PIPE_WR.store(fds[1], Ordering::Release);
+                if !is_running() {
+                    signal_stop_event();
+                }
+                Self {
+                    read_fd: fds[0],
+                    write_fd: fds[1],
+                }
+            } else {
+                Self {
+                    read_fd: -1,
+                    write_fd: -1,
+                }
+            }
+        }
+
+        #[inline]
+        pub fn wait_stop_or_timeout_ms(&self, timeout_ms: u32) {
+            if self.read_fd >= 0 && is_running() {
+                let mut pfd = PollFd {
+                    fd: self.read_fd,
+                    events: POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    let _ = poll(&mut pfd, 1, timeout_ms as i32);
+                }
+            }
+        }
+    }
+
+    impl Drop for ReactiveWaiter {
+        fn drop(&mut self) {
+            if self.write_fd >= 0 {
+                let _ = STOP_PIPE_WR.compare_exchange(
+                    self.write_fd,
+                    -1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                unsafe {
+                    let _ = close(self.write_fd);
+                }
+            }
+            if self.read_fd >= 0 {
+                unsafe {
+                    let _ = close(self.read_fd);
+                }
             }
         }
     }
@@ -1263,7 +1299,7 @@ mod imp {
 }
 
 pub use imp::{
-    DynamicLibrary, MonotonicClock, WaitTimer, abort, command_line_has_flag, exit_process,
+    DynamicLibrary, MonotonicClock, ReactiveWaiter, abort, command_line_has_flag, exit_process,
     install_signal_handlers, load_openvr_library, query_chaperone_file_stamp, query_process_stats,
     resolve_action_manifest_path, write_stderr, write_stdout,
 };
