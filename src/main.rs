@@ -4,7 +4,7 @@
 use core::fmt::Write;
 
 use nexashift::math::{HmdMatrix34_t, SimdMath, Vec3};
-use nexashift::openvr::{OpenVrError, OpenVrSession};
+use nexashift::openvr::{OpenVrError, OpenVrSession, set_steamvr_autolaunch};
 use nexashift::platform::{
     MonotonicClock, ReactiveWaiter, StackBuf, WaitOutcome, command_line_has_flag,
     install_signal_handlers, is_running, query_chaperone_file_stamp, query_process_stats,
@@ -58,6 +58,12 @@ fn print_openvr_error(err: OpenVrError) {
         OpenVrError::InputInitFailed(stage, code) => {
             print_err(format_args!(
                 "error: IVRInput::{} failed (EVRInputError={})\n",
+                stage, code
+            ));
+        }
+        OpenVrError::AppInstallFailed(stage, code) => {
+            print_err(format_args!(
+                "error: IVRApplications::{} failed (EVRApplicationError={})\n",
                 stage, code
             ));
         }
@@ -506,7 +512,6 @@ fn run_daemon(simd: SimdMath) -> i32 {
     }
 
     waiter.disarm_idle_timer();
-    session.restore_working_preview();
 
     0
 }
@@ -517,10 +522,38 @@ fn app_main() -> i32 {
     if command_line_has_flag(b"--help") || command_line_has_flag(b"-h") {
         print_out(format_args!(
             "nexashift - headless reactive 1:1 3D SteamVR playspace drag (simd={})\n\
-             usage: nexashift [--poc | --bench | --help]\n",
+             usage: nexashift [--install | --uninstall | --poc | --bench | --help]\n",
             simd.level_name()
         ));
         return 0;
+    }
+    if command_line_has_flag(b"--install") {
+        return match set_steamvr_autolaunch(true) {
+            Ok(()) => {
+                print_out(format_args!(
+                    "nexashift: registered with SteamVR auto-launch (nexashift.spacedrag)\n"
+                ));
+                0
+            }
+            Err(e) => {
+                print_openvr_error(e);
+                1
+            }
+        };
+    }
+    if command_line_has_flag(b"--uninstall") {
+        return match set_steamvr_autolaunch(false) {
+            Ok(()) => {
+                print_out(format_args!(
+                    "nexashift: removed from SteamVR auto-launch\n"
+                ));
+                0
+            }
+            Err(e) => {
+                print_openvr_error(e);
+                1
+            }
+        };
     }
     if command_line_has_flag(b"--poc") {
         return run_poc(simd);

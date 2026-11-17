@@ -5,7 +5,7 @@ use core::mem::{MaybeUninit, size_of};
 use crate::math::{HmdMatrix34_t, SimdMath, Vec3};
 use crate::platform::{
     DynamicLibrary, MappedReadOnlyShm, ProcessWaitHandle, StackBuf, find_connected_vrserver_shm,
-    open_property_container_shm, resolve_action_manifest_path,
+    open_property_container_shm, resolve_action_manifest_path, resolve_vrmanifest_path,
 };
 use crate::state::{Hand, HandInput, INVALID_DEVICE_INDEX, InputFrame};
 
@@ -296,6 +296,20 @@ pub struct VR_IVRSettings_FnTable {
     pub remove_key_in_section: *const c_void,
 }
 
+#[repr(C)]
+pub struct VR_IVRApplications_FnTable {
+    pub add_application_manifest: unsafe extern "system" fn(
+        pch_application_manifest_full_path: *const u8,
+        b_temporary: bool,
+    ) -> i32,
+    pub remove_application_manifest:
+        unsafe extern "system" fn(pch_application_manifest_full_path: *const u8) -> i32,
+    pub _middle_slots: [*const c_void; 15],
+    pub set_application_auto_launch:
+        unsafe extern "system" fn(pch_app_key: *const u8, b_auto_launch: bool) -> i32,
+    pub get_application_auto_launch: unsafe extern "system" fn(pch_app_key: *const u8) -> bool,
+}
+
 type FnVrInitInternal = unsafe extern "C" fn(pe_error: *mut i32, e_type: i32) -> isize;
 type FnVrShutdownInternal = unsafe extern "C" fn();
 type FnVrGetGenericInterface =
@@ -309,6 +323,7 @@ pub enum OpenVrError {
     InterfaceFailed(&'static str, i32),
     ManifestNotFound,
     InputInitFailed(&'static str, i32),
+    AppInstallFailed(&'static str, i32),
 }
 
 pub struct OpenVrSession {
@@ -1590,11 +1605,81 @@ impl BareMetalInputMonitor {
 
 impl Drop for OpenVrSession {
     fn drop(&mut self) {
-        self.restore_working_preview();
         unsafe {
             (self.fn_shutdown)();
         }
     }
+}
+
+pub fn set_steamvr_autolaunch(enable: bool) -> Result<(), OpenVrError> {
+    let mut vrmanifest_path = StackBuf::<520>::new();
+    if !resolve_vrmanifest_path(&mut vrmanifest_path) {
+        return Err(OpenVrError::ManifestNotFound);
+    }
+
+    let lib = crate::platform::load_openvr_library().ok_or(OpenVrError::LibraryNotFound)?;
+    let fn_init: FnVrInitInternal = unsafe {
+        let ptr = lib
+            .get_symbol(b"VR_InitInternal\0")
+            .ok_or(OpenVrError::MissingEntryPoint("VR_InitInternal"))?;
+        core::mem::transmute(ptr)
+    };
+    let fn_shutdown: FnVrShutdownInternal = unsafe {
+        let ptr = lib
+            .get_symbol(b"VR_ShutdownInternal\0")
+            .ok_or(OpenVrError::MissingEntryPoint("VR_ShutdownInternal"))?;
+        core::mem::transmute(ptr)
+    };
+    let fn_get_interface: FnVrGetGenericInterface = unsafe {
+        let ptr = lib
+            .get_symbol(b"VR_GetGenericInterface\0")
+            .ok_or(OpenVrError::MissingEntryPoint("VR_GetGenericInterface"))?;
+        core::mem::transmute(ptr)
+    };
+
+    let mut init_err = VR_INIT_ERROR_NONE;
+    let _token = unsafe { fn_init(&mut init_err, EVR_APPLICATION_BACKGROUND) };
+    if init_err != VR_INIT_ERROR_NONE {
+        return Err(OpenVrError::VrInitFailed(init_err));
+    }
+
+    let mut iface_err = VR_INIT_ERROR_NONE;
+    let apps_ptr = unsafe { fn_get_interface(b"FnTable:IVRApplications_007\0".as_ptr(), &mut iface_err) };
+    if apps_ptr == 0 || iface_err != VR_INIT_ERROR_NONE {
+        unsafe { fn_shutdown() };
+        return Err(OpenVrError::InterfaceFailed("IVRApplications_007", iface_err));
+    }
+    let vr_apps = apps_ptr as *const VR_IVRApplications_FnTable;
+    let app_key = b"nexashift.spacedrag\0".as_ptr();
+
+    let res = if enable {
+        let add_err = unsafe {
+            ((*vr_apps).add_application_manifest)(vrmanifest_path.as_bytes().as_ptr(), false)
+        };
+        if add_err != 0 {
+            Err(OpenVrError::AppInstallFailed("AddApplicationManifest", add_err))
+        } else {
+            let auto_err = unsafe { ((*vr_apps).set_application_auto_launch)(app_key, true) };
+            if auto_err != 0 {
+                Err(OpenVrError::AppInstallFailed("SetApplicationAutoLaunch", auto_err))
+            } else {
+                Ok(())
+            }
+        }
+    } else {
+        let _ = unsafe { ((*vr_apps).set_application_auto_launch)(app_key, false) };
+        let rem_err = unsafe {
+            ((*vr_apps).remove_application_manifest)(vrmanifest_path.as_bytes().as_ptr())
+        };
+        if rem_err != 0 {
+            Err(OpenVrError::AppInstallFailed("RemoveApplicationManifest", rem_err))
+        } else {
+            Ok(())
+        }
+    };
+
+    unsafe { fn_shutdown() };
+    res
 }
 
 #[cfg(test)]
@@ -1624,6 +1709,10 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(VR_IVROverlay_FnTable, wait_frame_sync),
             47 * size_of::<*const c_void>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(VR_IVRApplications_FnTable, set_application_auto_launch),
+            17 * size_of::<*const c_void>()
         );
     }
 

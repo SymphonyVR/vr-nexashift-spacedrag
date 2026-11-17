@@ -40,13 +40,30 @@ cargo build --release
 
 Keep the [manifest/](manifest/) directory accessible from the working directory (or alongside the executable) so SteamVR can load `manifest/actions.json` and the default binding files.
 
+### Auto-Start with SteamVR
+
+While SteamVR is running, you can register NexaShift to launch automatically whenever SteamVR starts:
+
+```powershell
+# Register manifest/nexashift.vrmanifest and enable SteamVR auto-launch
+.\target\release\nexashift.exe --install
+
+# Remove NexaShift from SteamVR auto-launch
+.\target\release\nexashift.exe --uninstall
+```
+
+You can also toggle it anytime inside SteamVR under **Settings → Startup/Shutdown → Choose Startup Overlay Apps** (`NexaShift`).
+
+> **Note:** [manifest/nexashift.vrmanifest](manifest/nexashift.vrmanifest) points to `../target/release/nexashift.exe` by default. If you move the executable elsewhere, keep `manifest/` next to it and update `binary_path_windows` (or `binary_path_linux`) inside `nexashift.vrmanifest` before running `--install`.
+
 ### CLI Modes
 
 ```text
-nexashift [--poc | --bench | --help]
+nexashift [--install | --uninstall | --poc | --bench | --help]
 ```
 
 - *(no flags)* — Starts the background daemon attached to the running SteamVR session.
+- `--install` / `--uninstall` — Registers or removes NexaShift from SteamVR's startup overlay apps (`manifest/nexashift.vrmanifest`).
 - `--poc` — Runs a 120-frame live movement test in memory, verifies readback accuracy, and restores your original playspace.
 - `--bench` — Runs a 5-second idle benchmark followed by a 5-second simulated drag benchmark, reporting wakeup rate, CPU cycles/time, memory usage, and latency.
 - `--help`, `-h` — Prints CLI usage and the runtime-detected SIMD level.

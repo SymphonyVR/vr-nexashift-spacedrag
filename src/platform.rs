@@ -981,55 +981,49 @@ mod imp {
         Some((attr.last_write_time.to_ns(), size))
     }
 
-    pub fn resolve_action_manifest_path(out: &mut StackBuf<520>) -> bool {
+    fn resolve_manifest_file(file_name: &[u8], out: &mut StackBuf<520>) -> bool {
+        let mut check = |base: &[u8], sub: &[u8]| -> bool {
+            out.clear();
+            let ok = out.push_bytes(base)
+                && out.push_bytes(sub)
+                && out.push_bytes(file_name)
+                && out.push_cstr_end();
+            ok && path_exists_utf8_nul(out.as_bytes())
+        };
+
         if let Some(exe_dir) = exe_dir_utf8() {
             let exe_bytes = exe_dir.as_bytes();
-            // <exe_dir>\manifest\actions.json
-            out.clear();
-            let _ = out.push_bytes(exe_bytes);
-            let _ = out.push_bytes(b"\\manifest\\actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
+            if check(exe_bytes, b"\\manifest\\") {
                 return true;
             }
-
-            // <exe_dir>\..\..\manifest\actions.json (typical cargo target/release layout)
             let p1 = pop_path_component(exe_bytes);
             let p2 = pop_path_component(p1);
-            if !p2.is_empty() {
-                out.clear();
-                let _ = out.push_bytes(p2);
-                let _ = out.push_bytes(b"\\manifest\\actions.json\0");
-                if path_exists_utf8_nul(out.as_bytes()) {
-                    return true;
-                }
+            if !p2.is_empty() && check(p2, b"\\manifest\\") {
+                return true;
             }
-
-            // <exe_dir>\actions.json
-            out.clear();
-            let _ = out.push_bytes(exe_bytes);
-            let _ = out.push_bytes(b"\\actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
+            if check(exe_bytes, b"\\") {
                 return true;
             }
         }
 
         if let Some(cwd) = cwd_utf8() {
-            out.clear();
-            let _ = out.push_bytes(cwd.as_bytes());
-            let _ = out.push_bytes(b"\\manifest\\actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
-                return true;
-            }
-
-            out.clear();
-            let _ = out.push_bytes(cwd.as_bytes());
-            let _ = out.push_bytes(b"\\actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
+            let cwd_bytes = cwd.as_bytes();
+            if check(cwd_bytes, b"\\manifest\\") || check(cwd_bytes, b"\\") {
                 return true;
             }
         }
 
         false
+    }
+
+    #[inline]
+    pub fn resolve_action_manifest_path(out: &mut StackBuf<520>) -> bool {
+        resolve_manifest_file(b"actions.json", out)
+    }
+
+    #[inline]
+    pub fn resolve_vrmanifest_path(out: &mut StackBuf<520>) -> bool {
+        resolve_manifest_file(b"nexashift.vrmanifest", out)
     }
 
     pub fn query_process_stats() -> ProcessStats {
@@ -1611,52 +1605,49 @@ mod imp {
         if size >= 0 { Some((0, size as u64)) } else { None }
     }
 
-    pub fn resolve_action_manifest_path(out: &mut StackBuf<520>) -> bool {
+    fn resolve_manifest_file(file_name: &[u8], out: &mut StackBuf<520>) -> bool {
+        let mut check = |base: &[u8], sub: &[u8]| -> bool {
+            out.clear();
+            let ok = out.push_bytes(base)
+                && out.push_bytes(sub)
+                && out.push_bytes(file_name)
+                && out.push_cstr_end();
+            ok && path_exists_utf8_nul(out.as_bytes())
+        };
+
         if let Some(exe_dir) = exe_dir_utf8() {
             let exe_bytes = exe_dir.as_bytes();
-            out.clear();
-            let _ = out.push_bytes(exe_bytes);
-            let _ = out.push_bytes(b"/manifest/actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
+            if check(exe_bytes, b"/manifest/") {
                 return true;
             }
-
             let p1 = pop_path_component(exe_bytes);
             let p2 = pop_path_component(p1);
-            if !p2.is_empty() {
-                out.clear();
-                let _ = out.push_bytes(p2);
-                let _ = out.push_bytes(b"/manifest/actions.json\0");
-                if path_exists_utf8_nul(out.as_bytes()) {
-                    return true;
-                }
+            if !p2.is_empty() && check(p2, b"/manifest/") {
+                return true;
             }
-
-            out.clear();
-            let _ = out.push_bytes(exe_bytes);
-            let _ = out.push_bytes(b"/actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
+            if check(exe_bytes, b"/") {
                 return true;
             }
         }
 
         if let Some(cwd) = cwd_utf8() {
-            out.clear();
-            let _ = out.push_bytes(cwd.as_bytes());
-            let _ = out.push_bytes(b"/manifest/actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
-                return true;
-            }
-
-            out.clear();
-            let _ = out.push_bytes(cwd.as_bytes());
-            let _ = out.push_bytes(b"/actions.json\0");
-            if path_exists_utf8_nul(out.as_bytes()) {
+            let cwd_bytes = cwd.as_bytes();
+            if check(cwd_bytes, b"/manifest/") || check(cwd_bytes, b"/") {
                 return true;
             }
         }
 
         false
+    }
+
+    #[inline]
+    pub fn resolve_action_manifest_path(out: &mut StackBuf<520>) -> bool {
+        resolve_manifest_file(b"actions.json", out)
+    }
+
+    #[inline]
+    pub fn resolve_vrmanifest_path(out: &mut StackBuf<520>) -> bool {
+        resolve_manifest_file(b"nexashift.vrmanifest", out)
     }
 
     pub fn query_process_stats() -> ProcessStats {
@@ -1780,7 +1771,8 @@ pub use imp::{
     DynamicLibrary, MappedReadOnlyShm, MonotonicClock, ProcessWaitHandle, ReactiveWaiter, abort,
     command_line_has_flag, exit_process, find_connected_vrserver_shm, install_signal_handlers,
     load_openvr_library, open_property_container_shm, query_chaperone_file_stamp,
-    query_process_stats, resolve_action_manifest_path, write_stderr, write_stdout,
+    query_process_stats, resolve_action_manifest_path, resolve_vrmanifest_path, write_stderr,
+    write_stdout,
 };
 
 #[cfg(test)]

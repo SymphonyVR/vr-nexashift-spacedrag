@@ -4,9 +4,9 @@
     {
       "app_key": "nexashift.spacedrag",
       "launch_type": "binary",
-      "binary_path_windows": "../nexashift.exe",
-      "binary_path_linux": "../nexashift",
-      "is_dashboard_overlay": false,
+      "binary_path_windows": "../target/release/nexashift.exe",
+      "binary_path_linux": "../target/release/nexashift",
+      "is_dashboard_overlay": true,
       "action_manifest_path": "actions.json",
       "strings": {
         "en_us": {
