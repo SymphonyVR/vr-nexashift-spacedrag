@@ -9,8 +9,8 @@
               "output": "/actions/main/in/space_drag"
             }
           },
-          "mode": "button",
-          "path": "/user/hand/left/input/grip"
+          "mode": "joystick",
+          "path": "/user/hand/left/input/joystick"
         },
         {
           "inputs": {
@@ -18,8 +18,28 @@
               "output": "/actions/main/in/space_drag"
             }
           },
+          "mode": "joystick",
+          "path": "/user/hand/right/input/joystick"
+        },
+        {
+          "inputs": {
+            "double": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
           "mode": "button",
-          "path": "/user/hand/right/input/grip"
+          "parameters": {},
+          "path": "/user/hand/left/input/y"
+        },
+        {
+          "inputs": {
+            "double": {
+              "output": "/actions/main/in/space_drag"
+            }
+          },
+          "mode": "button",
+          "parameters": {},
+          "path": "/user/hand/right/input/b"
         }
       ]
     }
