@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use core::ffi::c_void;
 use core::mem::{MaybeUninit, size_of};
 
@@ -16,7 +17,13 @@ pub const E_TRACKED_CONTROLLER_ROLE_LEFT_HAND: i32 = 1;
 pub const E_TRACKED_CONTROLLER_ROLE_RIGHT_HAND: i32 = 2;
 pub const PROP_DISPLAY_FREQUENCY_FLOAT: i32 = 2002;
 pub const VR_EVENT_QUIT: u32 = 700;
+pub const VR_EVENT_CHAPERONE_DATA_HAS_CHANGED: u32 = 800;
+pub const VR_EVENT_CHAPERONE_UNIVERSE_HAS_CHANGED: u32 = 801;
+pub const VR_EVENT_CHAPERONE_TEMP_DATA_HAS_CHANGED: u32 = 802;
+pub const VR_EVENT_CHAPERONE_ROOM_SETUP_COMMITTED: u32 = 805;
+pub const VR_EVENT_STANDING_ZERO_POSE_RESET: u32 = 808;
 pub const E_CHAPERONE_CONFIG_FILE_LIVE: i32 = 1;
+pub const K_N_ACTION_SET_OVERLAY_GLOBAL_PRIORITY_MAX: i32 = 0x01FF_FFFF;
 
 pub const VR_INIT_ERROR_NONE: i32 = 0;
 pub const VR_INPUT_ERROR_NONE: i32 = 0;
@@ -231,6 +238,30 @@ pub struct VR_IVROverlay_FnTable {
     pub _after_wait_frame_sync: [*const c_void; 34],
 }
 
+#[repr(C)]
+pub struct VR_IVRSettings_FnTable {
+    pub get_settings_error_name_from_enum: *const c_void,
+    pub set_bool: unsafe extern "system" fn(
+        pch_section: *const u8,
+        pch_settings_key: *const u8,
+        b_value: bool,
+        pe_error: *mut i32,
+    ),
+    pub set_int32: *const c_void,
+    pub set_float: *const c_void,
+    pub set_string: *const c_void,
+    pub get_bool: unsafe extern "system" fn(
+        pch_section: *const u8,
+        pch_settings_key: *const u8,
+        pe_error: *mut i32,
+    ) -> bool,
+    pub get_int32: *const c_void,
+    pub get_float: *const c_void,
+    pub get_string: *const c_void,
+    pub remove_section: *const c_void,
+    pub remove_key_in_section: *const c_void,
+}
+
 type FnVrInitInternal = unsafe extern "C" fn(pe_error: *mut i32, e_type: i32) -> isize;
 type FnVrShutdownInternal = unsafe extern "C" fn();
 type FnVrGetGenericInterface =
@@ -258,6 +289,8 @@ pub struct OpenVrSession {
     source_left: u64,
     source_right: u64,
     hmd_refresh_hz: f32,
+    working_set_synced: Cell<bool>,
+    dirty_uncommitted: Cell<bool>,
 }
 
 impl OpenVrSession {
@@ -310,6 +343,32 @@ impl OpenVrSession {
             get_table(b"FnTable:IVRInput_010\0", "IVRInput_010")? as *const VR_IVRInput_FnTable;
         let vr_overlay = get_table(b"FnTable:IVROverlay_026\0", "IVROverlay_026")?
             as *const VR_IVROverlay_FnTable;
+
+        let mut err = VR_INIT_ERROR_NONE;
+        let settings_ptr =
+            unsafe { fn_get_interface(b"FnTable:IVRSettings_003\0".as_ptr(), &mut err) };
+        if settings_ptr != 0 && err == VR_INIT_ERROR_NONE {
+            let vr_settings = settings_ptr as *const VR_IVRSettings_FnTable;
+            let mut s_err = 0i32;
+            let enabled = unsafe {
+                ((*vr_settings).get_bool)(
+                    b"steamvr\0".as_ptr(),
+                    b"globalActionSetPriority\0".as_ptr(),
+                    &mut s_err,
+                )
+            };
+            if s_err != 0 || !enabled {
+                s_err = 0;
+                unsafe {
+                    ((*vr_settings).set_bool)(
+                        b"steamvr\0".as_ptr(),
+                        b"globalActionSetPriority\0".as_ptr(),
+                        true,
+                        &mut s_err,
+                    );
+                }
+            }
+        }
 
         let mut action_set_main = 0u64;
         let mut action_space_drag = 0u64;
@@ -408,6 +467,8 @@ impl OpenVrSession {
             source_left,
             source_right,
             hmd_refresh_hz,
+            working_set_synced: Cell::new(false),
+            dirty_uncommitted: Cell::new(false),
         })
     }
 
@@ -433,9 +494,21 @@ impl OpenVrSession {
         unsafe {
             while ((*self.vr_system).poll_next_event)(event.as_mut_ptr(), event_size) {
                 let ev = event.assume_init();
-                if ev.event_type == VR_EVENT_QUIT {
-                    ((*self.vr_system).acknowledge_quit_exiting)();
-                    should_quit = true;
+                match ev.event_type {
+                    VR_EVENT_QUIT => {
+                        ((*self.vr_system).acknowledge_quit_exiting)();
+                        should_quit = true;
+                    }
+                    VR_EVENT_CHAPERONE_DATA_HAS_CHANGED
+                    | VR_EVENT_CHAPERONE_UNIVERSE_HAS_CHANGED
+                    | VR_EVENT_CHAPERONE_TEMP_DATA_HAS_CHANGED
+                    | VR_EVENT_CHAPERONE_ROOM_SETUP_COMMITTED
+                    | VR_EVENT_STANDING_ZERO_POSE_RESET => {
+                        if !self.dirty_uncommitted.get() {
+                            self.working_set_synced.set(false);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -448,7 +521,7 @@ impl OpenVrSession {
             ul_restricted_to_device: 0,
             ul_secondary_action_set: 0,
             un_padding: 0,
-            n_priority: 0,
+            n_priority: K_N_ACTION_SET_OVERLAY_GLOBAL_PRIORITY_MAX,
         };
         let err = unsafe {
             ((*self.vr_input).update_action_state)(
@@ -598,13 +671,27 @@ impl OpenVrSession {
 
     pub fn get_working_standing_pose(&self) -> Option<HmdMatrix34_t> {
         let mut mat = HmdMatrix34_t::IDENTITY;
-        unsafe {
-            ((*self.chaperone_setup).revert_working_copy)();
+        if !self.working_set_synced.get() {
+            unsafe {
+                ((*self.chaperone_setup).revert_working_copy)();
+            }
+            self.working_set_synced.set(true);
         }
         let ok = unsafe {
             ((*self.chaperone_setup).get_working_standing_zero_pose_to_raw_tracking_pose)(&mut mat)
         };
         if ok && mat.is_finite() {
+            return Some(mat);
+        }
+
+        unsafe {
+            ((*self.chaperone_setup).revert_working_copy)();
+        }
+        self.working_set_synced.set(true);
+        let ok_retry = unsafe {
+            ((*self.chaperone_setup).get_working_standing_zero_pose_to_raw_tracking_pose)(&mut mat)
+        };
+        if ok_retry && mat.is_finite() {
             Some(mat)
         } else {
             None
@@ -629,19 +716,34 @@ impl OpenVrSession {
             ((*self.chaperone_setup).set_working_standing_zero_pose_to_raw_tracking_pose)(mat);
             ((*self.chaperone_setup).show_working_set_preview)();
         }
+        self.working_set_synced.set(true);
+        self.dirty_uncommitted.set(true);
     }
 
     #[inline]
     pub fn commit_working_standing_pose(&self, mat: &HmdMatrix34_t) -> bool {
-        unsafe {
+        let ok = unsafe {
             ((*self.chaperone_setup).set_working_standing_zero_pose_to_raw_tracking_pose)(mat);
             ((*self.chaperone_setup).commit_working_copy)(E_CHAPERONE_CONFIG_FILE_LIVE)
+        };
+        self.working_set_synced.set(true);
+        self.dirty_uncommitted.set(false);
+        ok
+    }
+
+    pub fn flush_pending_commit(&self) {
+        if self.dirty_uncommitted.get() {
+            unsafe {
+                let _ = ((*self.chaperone_setup).commit_working_copy)(E_CHAPERONE_CONFIG_FILE_LIVE);
+            }
+            self.dirty_uncommitted.set(false);
         }
     }
 }
 
 impl Drop for OpenVrSession {
     fn drop(&mut self) {
+        self.flush_pending_commit();
         unsafe {
             (self.fn_shutdown)();
         }
@@ -666,6 +768,10 @@ mod tests {
         assert_eq!(
             size_of::<VR_IVROverlay_FnTable>(),
             82 * size_of::<*const c_void>()
+        );
+        assert_eq!(
+            size_of::<VR_IVRSettings_FnTable>(),
+            11 * size_of::<*const c_void>()
         );
         assert_eq!(
             core::mem::offset_of!(VR_IVROverlay_FnTable, wait_frame_sync),
