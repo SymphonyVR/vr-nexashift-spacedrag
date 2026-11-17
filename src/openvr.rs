@@ -5,7 +5,7 @@ use core::mem::{MaybeUninit, size_of};
 use crate::math::{HmdMatrix34_t, SimdMath, Vec3};
 use crate::platform::{
     DynamicLibrary, MappedReadOnlyShm, ProcessWaitHandle, StackBuf, find_connected_vrserver_shm,
-    resolve_action_manifest_path,
+    open_property_container_shm, resolve_action_manifest_path,
 };
 use crate::state::{Hand, HandInput, INVALID_DEVICE_INDEX, InputFrame};
 
@@ -815,31 +815,42 @@ impl OpenVrSession {
     }
 
     pub fn open_bare_metal_monitor(&self) -> Option<BareMetalInputMonitor> {
-        let (server_wait_handle, input_state_shm, conn_state_shm) = find_connected_vrserver_shm()?;
+        let (server_pid, server_wait_handle, input_state_shm, conn_state_shm) =
+            find_connected_vrserver_shm()?;
         let max_watched_component_type = self.space_drag_max_component_type();
         let mut monitor = BareMetalInputMonitor {
+            server_pid,
             server_wait_handle,
             input_state_shm,
             conn_state_shm,
             shm_valid: true,
             last_conn_seq: 0,
-            last_component_count: 0,
-            last_active_set_count: 0,
+            last_c1: 0,
+            last_c2: 0,
             max_watched_component_type,
             grace_until_ns: 0,
-            prev_words: [0; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
-            curr_words: [0; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
+            containers: [const { None }; MAX_WATCHED_CONTAINERS],
+            total_slots: 0,
+            prev_vals: [0; MAX_TOTAL_SLOTS],
+            curr_vals: [0; MAX_TOTAL_SLOTS],
         };
-        monitor.seed_snapshot();
+        if !monitor.rebuild_containers_and_seed() {
+            return None;
+        }
         Some(monitor)
     }
 }
 
 const SHM_MAX_COMPONENTS: usize = 512;
-const SHM_COMPONENT_WORDS: usize = 18;
+const SHM_COMPONENT_BYTES: usize = 72;
 const SHM_COUNT_OFFSET: usize = 0x9000;
 const SHM_ACTIVE_SET_COUNT_OFFSET: usize = 0x9808;
 const SHM_CONN_SEQ_OFFSET: usize = 0x408;
+const MAX_WATCHED_CONTAINERS: usize = 8;
+const MAX_SLOTS_PER_CONTAINER: usize = 32;
+const MAX_TOTAL_SLOTS: usize = 128;
+const PROP_TYPE_INPUT_COMPONENT: u32 = 0x21;
+const PROP_TABLE_ENTRY_BYTES: usize = 28;
 const POST_EDGE_GRACE_NS: u64 = 750_000_000;
 
 #[inline]
@@ -851,44 +862,35 @@ fn cstr_slice(buf: &[u8]) -> &[u8] {
     &buf[..len]
 }
 
-#[inline]
-fn u32_18_equal(a: &[u32], b: &[u32]) -> bool {
-    let mut diff = 0u32;
-    let mut i = 0;
-    while i < SHM_COMPONENT_WORDS {
-        diff |= a[i] ^ b[i];
-        i += 1;
-    }
-    diff == 0
+struct WatchedContainer {
+    hdr_shm: MappedReadOnlyShm,
+    storage_shm: MappedReadOnlyShm,
+    prop_count: u32,
+    storage_sz: u32,
+    slot_count: usize,
+    slots: [(usize, u32); MAX_SLOTS_PER_CONTAINER],
 }
 
-#[inline]
-fn u32_14_equal(a: &[u32], b: &[u32]) -> bool {
-    let mut diff = 0u32;
-    let mut i = 0;
-    while i < 14 {
-        diff |= a[i] ^ b[i];
-        i += 1;
-    }
-    diff == 0
-}
-
-/// Bare-metal shared-memory input watcher for `VR_InputState` & `VR_InputConnectionState`.
+/// Bare-metal shared-memory input watcher for SteamVR controller property containers.
 ///
-/// Avoids locking `VR_InputMutex` and `vrclient_x64.dll` per-frame C++ heap allocations while idle
-/// by scanning active shared-memory component slots with `fearless_simd` first.
+/// Maps each connected controller's `PC_<container>_storage0` read-only and samples only the live
+/// input component value fields (`+0x18`) with `fearless_simd`, avoiding `VR_InputMutex` syscalls
+/// and `vrclient_x64.dll` per-frame heap allocations while idle.
 pub struct BareMetalInputMonitor {
+    server_pid: u32,
     server_wait_handle: Option<ProcessWaitHandle>,
     input_state_shm: MappedReadOnlyShm,
     conn_state_shm: MappedReadOnlyShm,
     shm_valid: bool,
     last_conn_seq: u64,
-    last_component_count: u32,
-    last_active_set_count: u32,
+    last_c1: u32,
+    last_c2: u32,
     max_watched_component_type: u32,
     grace_until_ns: u64,
-    prev_words: [u32; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
-    curr_words: [u32; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
+    containers: [Option<WatchedContainer>; MAX_WATCHED_CONTAINERS],
+    total_slots: usize,
+    prev_vals: [u32; MAX_TOTAL_SLOTS],
+    curr_vals: [u32; MAX_TOTAL_SLOTS],
 }
 
 impl BareMetalInputMonitor {
@@ -898,42 +900,202 @@ impl BareMetalInputMonitor {
     }
 
     #[inline]
+    pub fn watched_slot_count(&self) -> usize {
+        self.total_slots
+    }
+
+    #[inline]
     pub fn extend_grace(&mut self, now_ns: u64) {
         self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
     }
 
-    pub fn seed_snapshot(&mut self) {
+    pub fn rebuild_containers_and_seed(&mut self) -> bool {
         let Some(conn_seq) = self.conn_state_shm.read_volatile_u64(SHM_CONN_SEQ_OFFSET) else {
             self.shm_valid = false;
-            return;
+            return false;
         };
         let Some(c1) = self.input_state_shm.read_volatile_u32(SHM_COUNT_OFFSET) else {
             self.shm_valid = false;
-            return;
+            return false;
         };
         let Some(c2) = self
             .input_state_shm
             .read_volatile_u32(SHM_ACTIVE_SET_COUNT_OFFSET)
         else {
             self.shm_valid = false;
-            return;
+            return false;
         };
         if (c1 as usize) > SHM_MAX_COMPONENTS || c2 > 128 {
             self.shm_valid = false;
-            return;
+            return false;
         }
-        let words = (c1 as usize) * SHM_COMPONENT_WORDS;
-        if words > 0 && !self.input_state_shm.copy_volatile_u32_words(0, &mut self.prev_words[..words])
-        {
-            self.shm_valid = false;
-            return;
+
+        let mut devs = [u32::MAX; MAX_WATCHED_CONTAINERS];
+        let mut dev_count = 0usize;
+        let mut i = 0usize;
+        while i < (c1 as usize) {
+            let entry_off = i * SHM_COMPONENT_BYTES;
+            let Some(comp_type) = self.input_state_shm.read_volatile_u32(entry_off) else {
+                self.shm_valid = false;
+                return false;
+            };
+            let Some(dev_idx) = self.input_state_shm.read_volatile_u32(entry_off + 0x20) else {
+                self.shm_valid = false;
+                return false;
+            };
+            if comp_type <= 2 && (1..64).contains(&dev_idx) {
+                let mut seen = false;
+                let mut k = 0;
+                while k < dev_count {
+                    if devs[k] == dev_idx {
+                        seen = true;
+                        break;
+                    }
+                    k += 1;
+                }
+                if !seen && dev_count < MAX_WATCHED_CONTAINERS {
+                    devs[dev_count] = dev_idx;
+                    dev_count += 1;
+                }
+            }
+            i += 1;
         }
+
+        for slot in &mut self.containers {
+            *slot = None;
+        }
+        self.total_slots = 0;
+
+        let mut container_idx = 0usize;
+        let mut d = 0usize;
+        while d < dev_count {
+            let cid = 0x1_0000_0000u64 + (devs[d] as u64);
+            let Some((hdr_shm, tbl_shm, sto_shm)) =
+                open_property_container_shm(self.server_pid, cid)
+            else {
+                // Controller device listed in VR_InputState without readable PC SHM: fall back safely.
+                self.shm_valid = false;
+                return false;
+            };
+            let Some(prop_count) = hdr_shm.read_volatile_u32(4) else {
+                self.shm_valid = false;
+                return false;
+            };
+            let Some(storage_sz) = hdr_shm.read_volatile_u32(8) else {
+                self.shm_valid = false;
+                return false;
+            };
+
+            let mut container = WatchedContainer {
+                hdr_shm,
+                storage_shm: sto_shm,
+                prop_count,
+                storage_sz,
+                slot_count: 0,
+                slots: [(0, 0); MAX_SLOTS_PER_CONTAINER],
+            };
+
+            let mut p = 0usize;
+            while p < (prop_count as usize) {
+                let toff = p * PROP_TABLE_ENTRY_BYTES;
+                let Some(ptype) = tbl_shm.read_volatile_u32(toff + 8) else {
+                    break;
+                };
+                let Some(soff) = tbl_shm.read_volatile_u32(toff + 16) else {
+                    break;
+                };
+                let Some(slen) = tbl_shm.read_volatile_u32(toff + 20) else {
+                    break;
+                };
+                if ptype == PROP_TYPE_INPUT_COMPONENT
+                    && (slen as usize) == SHM_COMPONENT_BYTES
+                    && (soff as usize) + SHM_COMPONENT_BYTES <= (storage_sz as usize)
+                {
+                    let Some(ctype) = container.storage_shm.read_volatile_u32(soff as usize + 0x10)
+                    else {
+                        break;
+                    };
+                    if ctype >= 1 && ctype <= self.max_watched_component_type.min(2) {
+                        if container.slot_count < MAX_SLOTS_PER_CONTAINER
+                            && self.total_slots < MAX_TOTAL_SLOTS
+                        {
+                            container.slots[container.slot_count] = (soff as usize, ctype);
+                            container.slot_count += 1;
+                            self.total_slots += 1;
+                        }
+                    }
+                }
+                p += 1;
+            }
+
+            if container.slot_count == 0 {
+                self.shm_valid = false;
+                return false;
+            }
+            self.containers[container_idx] = Some(container);
+            container_idx += 1;
+            d += 1;
+        }
+
         self.last_conn_seq = conn_seq;
-        self.last_component_count = c1;
-        self.last_active_set_count = c2;
+        self.last_c1 = c1;
+        self.last_c2 = c2;
+        if !self.read_all_slots_into_prev() {
+            self.shm_valid = false;
+            return false;
+        }
+        self.shm_valid = true;
+        true
     }
 
-    /// Checks SteamVR shared memory via SIMD. Returns `(should_sample_openvr, bindings_changed)`.
+    fn read_slot_value(sto: &MappedReadOnlyShm, off: usize, ctype: u32) -> Option<u32> {
+        if ctype == 1 {
+            let b = sto.read_volatile_u8(off + 0x18)?;
+            Some(if b != 0 { 1 } else { 0 })
+        } else {
+            let raw = sto.read_volatile_u32(off + 0x18)?;
+            let f = f32::from_bits(raw);
+            let bucket = if f.is_finite() {
+                (f.clamp(-1.0, 1.0) * 20.0) as i32
+            } else {
+                0
+            };
+            Some(bucket as u32)
+        }
+    }
+
+    fn read_all_slots_into(&mut self, into_prev: bool) -> bool {
+        let mut idx = 0usize;
+        let mut cidx = 0usize;
+        while cidx < self.containers.len() {
+            if let Some(ref c) = self.containers[cidx] {
+                let mut s = 0usize;
+                while s < c.slot_count {
+                    let (off, ctype) = c.slots[s];
+                    let Some(val) = Self::read_slot_value(&c.storage_shm, off, ctype) else {
+                        return false;
+                    };
+                    if into_prev {
+                        self.prev_vals[idx] = val;
+                    } else {
+                        self.curr_vals[idx] = val;
+                    }
+                    idx += 1;
+                    s += 1;
+                }
+            }
+            cidx += 1;
+        }
+        idx == self.total_slots
+    }
+
+    #[inline]
+    fn read_all_slots_into_prev(&mut self) -> bool {
+        self.read_all_slots_into(true)
+    }
+
+    /// Checks SteamVR live controller property containers via SIMD.
+    /// Returns `(should_sample_openvr, bindings_or_devices_changed)`.
     pub fn poll_should_sample(&mut self, simd: SimdMath, now_ns: u64) -> (bool, bool) {
         if !self.shm_valid {
             return (true, false);
@@ -960,64 +1122,51 @@ impl BareMetalInputMonitor {
         }
 
         let conn_changed = conn_seq != self.last_conn_seq;
-        let words = (c1 as usize) * SHM_COMPONENT_WORDS;
-        if words > 0
-            && !self
-                .input_state_shm
-                .copy_volatile_u32_words(0, &mut self.curr_words[..words])
-        {
+        let mut topology_changed = conn_changed || c1 != self.last_c1 || c2 != self.last_c2;
+        if !topology_changed {
+            let mut cidx = 0usize;
+            while cidx < self.containers.len() {
+                if let Some(ref c) = self.containers[cidx] {
+                    let Some(cur_count) = c.hdr_shm.read_volatile_u32(4) else {
+                        self.shm_valid = false;
+                        return (true, false);
+                    };
+                    let Some(cur_sz) = c.hdr_shm.read_volatile_u32(8) else {
+                        self.shm_valid = false;
+                        return (true, false);
+                    };
+                    if cur_count != c.prop_count || cur_sz != c.storage_sz {
+                        topology_changed = true;
+                        break;
+                    }
+                }
+                cidx += 1;
+            }
+        }
+
+        if topology_changed {
+            self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
+            return (true, true);
+        }
+
+        if !self.read_all_slots_into(false) {
             self.shm_valid = false;
             return (true, false);
         }
 
-        if !conn_changed
-            && c1 == self.last_component_count
-            && c2 == self.last_active_set_count
-            && simd.slices_equal_u32(&self.curr_words[..words], &self.prev_words[..words])
-        {
+        let n = self.total_slots;
+        if simd.slices_equal_u32(&self.curr_vals[..n], &self.prev_vals[..n]) {
             return (now_ns < self.grace_until_ns, false);
         }
 
-        let meta_count_changed =
-            conn_changed || c1 != self.last_component_count || c2 != self.last_active_set_count;
-        self.last_conn_seq = conn_seq;
-        self.last_component_count = c1;
-        self.last_active_set_count = c2;
-
-        if meta_count_changed {
-            self.prev_words[..words].copy_from_slice(&self.curr_words[..words]);
-            self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
-            return (true, conn_changed);
-        }
-
-        let mut watched_changed = false;
-        let mut idx = 0usize;
-        while idx < words {
-            let new_slot = &self.curr_words[idx..idx + SHM_COMPONENT_WORDS];
-            let old_slot = &self.prev_words[idx..idx + SHM_COMPONENT_WORDS];
-            if !u32_18_equal(old_slot, new_slot) {
-                let comp_type = new_slot[0];
-                if !u32_14_equal(old_slot, new_slot)
-                    || comp_type <= self.max_watched_component_type
-                {
-                    watched_changed = true;
-                }
-            }
-            idx += SHM_COMPONENT_WORDS;
-        }
-        self.prev_words[..words].copy_from_slice(&self.curr_words[..words]);
-
-        if watched_changed {
-            self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
-            (true, false)
-        } else {
-            (now_ns < self.grace_until_ns, false)
-        }
+        self.prev_vals[..n].copy_from_slice(&self.curr_vals[..n]);
+        self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
+        (true, false)
     }
 
     #[inline]
     pub fn set_max_watched_component_type(&mut self, max_type: u32) {
-        self.max_watched_component_type = max_type.clamp(1, 3);
+        self.max_watched_component_type = max_type.clamp(1, 2);
     }
 }
 

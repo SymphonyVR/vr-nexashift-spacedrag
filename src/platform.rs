@@ -672,6 +672,15 @@ mod imp {
         }
 
         #[inline]
+        pub fn read_volatile_u8(&self, byte_offset: usize) -> Option<u8> {
+            if byte_offset >= self.len {
+                return None;
+            }
+            let ptr = unsafe { self.view.add(byte_offset) };
+            Some(unsafe { core::ptr::read_volatile(ptr) })
+        }
+
+        #[inline]
         pub fn read_volatile_u32(&self, byte_offset: usize) -> Option<u32> {
             if byte_offset.checked_add(4)? > self.len {
                 return None;
@@ -780,7 +789,7 @@ mod imp {
     }
 
     pub fn find_connected_vrserver_shm(
-    ) -> Option<(Option<ProcessWaitHandle>, MappedReadOnlyShm, MappedReadOnlyShm)> {
+    ) -> Option<(u32, Option<ProcessWaitHandle>, MappedReadOnlyShm, MappedReadOnlyShm)> {
         let self_pid = unsafe { GetCurrentProcessId() };
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snap == INVALID_HANDLE_VALUE || snap == 0 {
@@ -807,7 +816,7 @@ mod imp {
                     MappedReadOnlyShm::open_utf8(state_name.as_bytes(), 0x9810),
                 ) {
                     let wait_handle = ProcessWaitHandle::open_sync(server_pid);
-                    found = Some((wait_handle, state_shm, conn_shm));
+                    found = Some((server_pid, wait_handle, state_shm, conn_shm));
                     break;
                 }
             }
@@ -819,6 +828,41 @@ mod imp {
             let _ = CloseHandle(snap);
         }
         found
+    }
+
+    pub fn open_property_container_shm(
+        server_pid: u32,
+        container_id: u64,
+    ) -> Option<(MappedReadOnlyShm, MappedReadOnlyShm, MappedReadOnlyShm)> {
+        let mut hdr_name = StackBuf::<128>::new();
+        let _ = write!(
+            hdr_name,
+            "PC_{:x}_header_{}-IPCWrapper\0",
+            container_id, server_pid
+        );
+        let hdr_shm = MappedReadOnlyShm::open_utf8(hdr_name.as_bytes(), 64)?;
+        let count = hdr_shm.read_volatile_u32(4)?;
+        let storage_sz = hdr_shm.read_volatile_u32(8)?;
+        if count == 0 || count > 512 || storage_sz == 0 || storage_sz > 65_536 {
+            return None;
+        }
+
+        let mut tbl_name = StackBuf::<128>::new();
+        let _ = write!(
+            tbl_name,
+            "PC_{:x}_table0_{}-IPCWrapper\0",
+            container_id, server_pid
+        );
+        let tbl_shm = MappedReadOnlyShm::open_utf8(tbl_name.as_bytes(), (count as usize) * 28)?;
+
+        let mut sto_name = StackBuf::<128>::new();
+        let _ = write!(
+            sto_name,
+            "PC_{:x}_storage0_{}-IPCWrapper\0",
+            container_id, server_pid
+        );
+        let sto_shm = MappedReadOnlyShm::open_utf8(sto_name.as_bytes(), storage_sz as usize)?;
+        Some((hdr_shm, tbl_shm, sto_shm))
     }
 
     pub struct DynamicLibrary {
@@ -1392,6 +1436,11 @@ mod imp {
 
     impl MappedReadOnlyShm {
         #[inline]
+        pub fn read_volatile_u8(&self, _byte_offset: usize) -> Option<u8> {
+            None
+        }
+
+        #[inline]
         pub fn read_volatile_u32(&self, _byte_offset: usize) -> Option<u32> {
             None
         }
@@ -1417,7 +1466,14 @@ mod imp {
     }
 
     pub fn find_connected_vrserver_shm(
-    ) -> Option<(Option<ProcessWaitHandle>, MappedReadOnlyShm, MappedReadOnlyShm)> {
+    ) -> Option<(u32, Option<ProcessWaitHandle>, MappedReadOnlyShm, MappedReadOnlyShm)> {
+        None
+    }
+
+    pub fn open_property_container_shm(
+        _server_pid: u32,
+        _container_id: u64,
+    ) -> Option<(MappedReadOnlyShm, MappedReadOnlyShm, MappedReadOnlyShm)> {
         None
     }
 
@@ -1723,8 +1779,8 @@ mod imp {
 pub use imp::{
     DynamicLibrary, MappedReadOnlyShm, MonotonicClock, ProcessWaitHandle, ReactiveWaiter, abort,
     command_line_has_flag, exit_process, find_connected_vrserver_shm, install_signal_handlers,
-    load_openvr_library, query_chaperone_file_stamp, query_process_stats,
-    resolve_action_manifest_path, write_stderr, write_stdout,
+    load_openvr_library, open_property_container_shm, query_chaperone_file_stamp,
+    query_process_stats, resolve_action_manifest_path, write_stderr, write_stdout,
 };
 
 #[cfg(test)]

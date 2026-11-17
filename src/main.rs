@@ -223,17 +223,17 @@ fn run_bench(simd: SimdMath) -> i32 {
     let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
 
     print_out(format_args!(
-        "bench[init]: simd={}, hmd_hz={}, shm={}, idle_period_ms={}\n",
+        "bench[init]: simd={}, hmd_hz={}, shm={}, shm_slots={}, idle_period_ms={}\n",
         simd.level_name(),
         session.hmd_refresh_hz() as u32,
         monitor.is_some(),
+        monitor.as_ref().map_or(0, |m| m.watched_slot_count()),
         idle_period_ms
     ));
 
     let clock = MonotonicClock::new();
     let waiter = ReactiveWaiter::new();
     let mut sm = DragStateMachine::with_simd(simd);
-    let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
 
     // 1. Bare-metal idle benchmark (5 seconds at native VR frame rate via high-res timer + SIMD SHM watch).
     let bench_duration_ns: u64 = 5_000_000_000;
@@ -247,6 +247,7 @@ fn run_bench(simd: SimdMath) -> i32 {
         if now_ns.saturating_sub(idle_t0) >= bench_duration_ns {
             break;
         }
+        let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
         match waiter.wait_idle_tick(watch_handle, idle_period_ms) {
             WaitOutcome::Tick => {}
             WaitOutcome::Stop | WaitOutcome::ServerExited => break,
@@ -263,8 +264,15 @@ fn run_bench(simd: SimdMath) -> i32 {
             let frame = session.sample_inputs(sm.active_device_hint());
             let _ = sm.step_with(frame, || session.get_working_standing_pose());
             if bindings_changed {
+                let mut drop_monitor = false;
                 if let Some(m) = monitor.as_mut() {
                     m.set_max_watched_component_type(session.space_drag_max_component_type());
+                    if !m.rebuild_containers_and_seed() {
+                        drop_monitor = true;
+                    }
+                }
+                if drop_monitor {
+                    monitor = None;
                 }
             }
         }
@@ -410,7 +418,6 @@ fn run_daemon(simd: SimdMath) -> i32 {
 
     let _ = session.sample_inputs(None);
     let mut monitor = session.open_bare_metal_monitor();
-    let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
     let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
 
     let clock = MonotonicClock::new();
@@ -445,14 +452,21 @@ fn run_daemon(simd: SimdMath) -> i32 {
             }
             if !sm.is_dragging() {
                 let now_ns = clock.now_ns();
+                let mut drop_monitor = false;
                 if let Some(m) = monitor.as_mut() {
                     m.extend_grace(now_ns);
-                    m.seed_snapshot();
+                    if !m.rebuild_containers_and_seed() {
+                        drop_monitor = true;
+                    }
+                }
+                if drop_monitor {
+                    monitor = None;
                 }
             }
             continue;
         }
 
+        let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
         match waiter.wait_idle_tick(watch_handle, idle_period_ms) {
             WaitOutcome::Tick => {}
             WaitOutcome::Stop | WaitOutcome::ServerExited => break,
@@ -479,9 +493,15 @@ fn run_daemon(simd: SimdMath) -> i32 {
 
         let frame = session.sample_inputs(sm.active_device_hint());
         if bindings_changed {
+            let mut drop_monitor = false;
             if let Some(m) = monitor.as_mut() {
                 m.set_max_watched_component_type(session.space_drag_max_component_type());
-                m.seed_snapshot();
+                if !m.rebuild_containers_and_seed() {
+                    drop_monitor = true;
+                }
+            }
+            if drop_monitor {
+                monitor = None;
             }
         }
         match sm.step_with(frame, || session.get_working_standing_pose()) {
