@@ -10,7 +10,7 @@ use nexashift::platform::{
     install_signal_handlers, is_running, query_chaperone_file_stamp, query_process_stats,
     write_stderr, write_stdout,
 };
-use nexashift::state::{DragPhase, DragStateMachine, HandInput, InputFrame, StepAction};
+use nexashift::state::{DragStateMachine, HandInput, InputFrame, StepAction};
 
 #[cfg(all(not(test), target_os = "windows"))]
 #[link(name = "vcruntime")]
@@ -184,7 +184,7 @@ fn run_poc(simd: SimdMath) -> i32 {
 
     let chap_after = query_chaperone_file_stamp();
     let chaperone_unmodified = chap_before.is_some() && chap_before == chap_after;
-    let _ = session.commit_working_standing_pose(&m0);
+    session.restore_working_preview();
     let stats_after = query_process_stats();
     let ipc_write_bytes = stats_after.write_bytes.saturating_sub(stats_before.write_bytes);
     let avg_us = (sum_ns / steps) as f64 / 1000.0;
@@ -373,7 +373,7 @@ fn run_bench(simd: SimdMath) -> i32 {
     let drag_end_stats = query_process_stats();
     let drag_chap_after = query_chaperone_file_stamp();
     let drag_chap_modified = drag_chap_before != drag_chap_after;
-    let _ = session.commit_working_standing_pose(&m0);
+    session.restore_working_preview();
     let drag_cpu_ns = drag_end_stats
         .cpu_time_ns
         .saturating_sub(drag_start_stats.cpu_time_ns);
@@ -506,16 +506,7 @@ fn run_daemon(simd: SimdMath) -> i32 {
     }
 
     waiter.disarm_idle_timer();
-    if let DragPhase::Dragging {
-        moved: true,
-        last_m,
-        ..
-    } = sm.phase()
-    {
-        let _ = session.commit_working_standing_pose(&last_m);
-    } else {
-        session.flush_pending_commit();
-    }
+    session.restore_working_preview();
 
     0
 }

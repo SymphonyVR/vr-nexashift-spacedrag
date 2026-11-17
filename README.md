@@ -7,7 +7,7 @@ A lightweight, headless `#![no_std]` Rust utility for 1:1 3D SteamVR playspace d
 - **1:1 Playspace Dragging:** Grab any point in 3D space with a controller and move your standing playspace without cumulative floating-point drift.
 - **Works In-Game & in the SteamVR Dashboard:** Normal SteamVR background apps stop receiving controller actions whenever the Dashboard opens. NexaShift automatically falls back to reading your bound controller buttons from SteamVR's shared memory so you can drag anywhere.
 - **~0.0% Idle CPU at Headset Refresh Rate:** Uses a high-resolution OS timer (every `8–12 ms`, matching `90–144 Hz` headsets) and checks only a few bytes of read-only shared memory with runtime-detected SIMD (`fearless_simd`), skipping SteamVR's heavier input API until a button actually changes.
-- **In-Memory Updates During Your Session:** Moves stay in SteamVR's live working-set preview while you play and only save to `chaperone_info.vrchap` on exit, avoiding repeated disk writes and preventing SteamVR from re-centering your Dashboard mid-session.
+- **Session-Only (Never Overwrites Room Setup):** Moves stay in SteamVR's live working-set preview in memory while you play and revert cleanly when NexaShift exits—your calibrated room center and `chaperone_info.vrchap` file are never touched, so SteamVR always starts centered next time and never resets your Dashboard mid-session.
 - **Zero Heap Allocations (`#![no_std]`):** Written in pure `#![no_std]` Rust without `alloc`, calling OpenVR and OS APIs directly via C FFI.
 
 ## Default Controls
@@ -56,7 +56,7 @@ nexashift [--poc | --bench | --help]
 1. **Idle Watching:** Instead of polling OpenVR's full action system every tick (which takes locks and allocates memory inside SteamVR's client DLL), NexaShift maps SteamVR's read-only shared memory for your bound drag buttons and wakes on a high-resolution timer (`8–12 ms`).
 2. **Active Dragging:** Once you press a drag button, the loop switches to compositor frame sync (`WaitFrameSync`), captures your controller's starting pose and playspace matrix, and applies `1:1` inverse motion relative to that anchor pose—so there is zero frame-to-frame drift.
 3. **Dashboard Fallback:** If SteamVR marks action data as inactive while the Dashboard is open, NexaShift evaluates the bound raw button slots from shared memory directly (including a 500 ms double-press state machine for `B`/`Y` or Menu buttons) alongside live controller tracking poses.
-4. **Saving Position:** Live updates use SteamVR's working-set preview in memory; `CommitWorkingCopy` is only called on shutdown so `vrcompositor` doesn't receive room-setup commit events that reset the Dashboard position during a session.
+4. **Session-Only Position (No Disk Saves):** Live updates use SteamVR's in-memory working-set preview (`ShowWorkingSetPreview`) and never call `CommitWorkingCopy`. This keeps your saved room calibration intact for your next SteamVR launch and ensures `vrcompositor` never receives room-setup commit events that reset the Dashboard mid-session.
 
 ## Tests
 

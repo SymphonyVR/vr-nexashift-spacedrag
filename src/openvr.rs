@@ -810,23 +810,14 @@ impl OpenVrSession {
         self.dirty_uncommitted.set(true);
     }
 
-    #[inline]
-    pub fn commit_working_standing_pose(&self, mat: &HmdMatrix34_t) -> bool {
-        let ok = unsafe {
-            ((*self.chaperone_setup).set_working_standing_zero_pose_to_raw_tracking_pose)(mat);
-            ((*self.chaperone_setup).commit_working_copy)(E_CHAPERONE_CONFIG_FILE_LIVE)
-        };
-        self.working_set_synced.set(true);
-        self.dirty_uncommitted.set(false);
-        ok
-    }
-
-    pub fn flush_pending_commit(&self) {
+    pub fn restore_working_preview(&self) {
         if self.dirty_uncommitted.get() {
             unsafe {
-                let _ = ((*self.chaperone_setup).commit_working_copy)(E_CHAPERONE_CONFIG_FILE_LIVE);
+                ((*self.chaperone_setup).hide_working_set_preview)();
+                ((*self.chaperone_setup).revert_working_copy)();
             }
             self.dirty_uncommitted.set(false);
+            self.working_set_synced.set(false);
         }
     }
 
@@ -1599,7 +1590,7 @@ impl BareMetalInputMonitor {
 
 impl Drop for OpenVrSession {
     fn drop(&mut self) {
-        self.flush_pending_commit();
+        self.restore_working_preview();
         unsafe {
             (self.fn_shutdown)();
         }
