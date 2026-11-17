@@ -1,21 +1,20 @@
 # NexaShift
 
-A lightweight, background SteamVR app that lets you grab and pull your VR playspace in 3D space (1:1 movement) while using **~0.0% CPU** when idle.
+A lightweight, headless `#![no_std]` Rust utility for 1:1 3D SteamVR playspace dragging (`space_drag`), designed for **~0.0% idle CPU usage** and native headset-frame responsiveness both in-game and inside the SteamVR Dashboard.
 
-No window, no overlay clutter — just start it alongside SteamVR and drag.
+## Highlights
 
-## Features
-
-- **1:1 Playspace Dragging:** Hold the drag button and move your controller to pull the world around you smoothly in any direction. Walking around your room doesn't drift or fight your drag.
-- **Works Everywhere in VR (In-Game & SteamVR Dashboard):** Keeps working even when the SteamVR Dashboard or overlay menus are open, where SteamVR normally blocks background apps from seeing controller buttons.
-- **Instant Response, ~0.0% Idle CPU:** Checks your controllers at your headset's refresh rate (around every 8–12 ms) without waking up SteamVR's heavy input system until you actually press a button.
-- **Gentle on Your Drive:** Moves your playspace smoothly in memory while you drag, then waits **3 seconds after you let go** (or when exiting) before saving the new position to SteamVR's settings file.
+- **1:1 Playspace Dragging:** Grab any point in 3D space with a controller and move your standing playspace without cumulative floating-point drift.
+- **Works In-Game & in the SteamVR Dashboard:** Normal SteamVR background apps stop receiving controller actions whenever the Dashboard opens. NexaShift automatically falls back to reading your bound controller buttons from SteamVR's shared memory so you can drag anywhere.
+- **~0.0% Idle CPU at Headset Refresh Rate:** Uses a high-resolution OS timer (every `8–12 ms`, matching `90–144 Hz` headsets) and checks only a few bytes of read-only shared memory with runtime-detected SIMD (`fearless_simd`), skipping SteamVR's heavier input API until a button actually changes.
+- **Debounced Disk Saves:** During a drag, changes stay in memory (previewed every VR frame). SteamVR's `chaperone_info.vrchap` config file is only written to disk once, 3 seconds after you release the drag (or when exiting).
+- **Zero Heap Allocations (`#![no_std]`):** Written in pure `#![no_std]` Rust without `alloc`, calling OpenVR and OS APIs directly via C FFI.
 
 ## Default Controls
 
-You can customize these anytime inside SteamVR's **Controller Bindings** settings:
+Defined in [manifest/actions.json](manifest/actions.json) and editable anytime in SteamVR's **Controller Bindings** UI:
 
-| Headset / Controllers | Hold to Drag | Alternate (Double-Press & Hold) |
+| Controller Profile | Click & Hold | Double-Press & Hold |
 | --- | --- | --- |
 | **Oculus Touch / Pico / Quest** | Left or Right **Joystick Click** | Left **Y** or Right **B** |
 | **Valve Index (Knuckles)** | Left or Right **Thumbstick Click** | Left or Right **B** |
@@ -26,31 +25,38 @@ You can customize these anytime inside SteamVR's **Controller Bindings** setting
 
 ### Requirements
 
-- **SteamVR** running (built and tested on Windows; Linux support is also included).
-- **Rust** toolchain (`cargo`) if building from source.
+- **SteamVR** running (tested on Windows; Linux OS bindings are also included in [src/platform.rs](src/platform.rs)).
+- **Rust** toolchain (`cargo`, edition 2024).
 
 ### Build & Run
 
 ```powershell
-# Build the release binary
+# Build optimized release binary
 cargo build --release
 
-# Start NexaShift in the background
+# Start the background daemon
 .\target\release\nexashift.exe
 ```
 
-Keep the `manifest/` folder alongside the executable (or run from the project folder) so SteamVR can find the action and default controller bindings.
+Keep the [manifest/](manifest/) directory accessible from the working directory (or alongside the executable) so SteamVR can load `manifest/actions.json` and the default binding files.
 
-### Extra Command-Line Options
+### CLI Modes
 
 ```text
 nexashift [--poc | --bench | --help]
 ```
 
-- *(no flags)* — Normal mode: runs quietly in the background with SteamVR.
-- `--poc` — Runs a short automated 120-frame movement test and restores your playspace back where it started.
-- `--bench` — Runs a 10-second performance test (5s idle + 5s simulated dragging) and prints CPU, memory, and latency numbers.
-- `--help`, `-h` — Shows command usage.
+- *(no flags)* — Starts the background daemon attached to the running SteamVR session.
+- `--poc` — Runs a 120-frame live movement test in memory, verifies readback accuracy, and restores your original playspace.
+- `--bench` — Runs a 5-second idle benchmark followed by a 5-second simulated drag benchmark, reporting wakeup rate, CPU cycles/time, memory usage, and latency.
+- `--help`, `-h` — Prints CLI usage and the runtime-detected SIMD level.
+
+## How It Works
+
+1. **Idle Watching:** Instead of polling OpenVR's full action system every tick (which takes locks and allocates memory inside SteamVR's client DLL), NexaShift maps SteamVR's read-only shared memory for your bound drag buttons and wakes on a high-resolution timer (`8–12 ms`).
+2. **Active Dragging:** Once you press a drag button, the loop switches to compositor frame sync (`WaitFrameSync`), captures your controller's starting pose and playspace matrix, and applies `1:1` inverse motion relative to that anchor pose—so there is zero frame-to-frame drift.
+3. **Dashboard Fallback:** If SteamVR marks action data as inactive while the Dashboard is open, NexaShift evaluates the bound raw button slots from shared memory directly (including a 500 ms double-press state machine for `B`/`Y` or Menu buttons) alongside live controller tracking poses.
+4. **Saving Position:** Live updates use SteamVR's working-set preview in memory; `CommitWorkingCopy` is deferred until 3 seconds after drag release or shutdown.
 
 ## Tests
 
@@ -59,24 +65,14 @@ cargo test
 cargo check --target x86_64-unknown-linux-gnu
 ```
 
-<details>
-<summary>Technical Details (Under the Hood)</summary>
+## Project Structure
 
-- **No Standard Library (`#![no_std]`):** Compiles with zero heap allocations (`no_std` / no `alloc`) for minimal memory footprint (`~5.6 MB` private memory) and deterministic timing.
-- **Low-Overhead Idle Watching:** Reads SteamVR's shared memory (`VR_InputState` and per-controller `PC_<container>_storage0` component slots) via read-only memory maps and runtime-detected SIMD (`fearless_simd`), synchronized with a high-resolution Windows waitable timer (`CreateWaitableTimerExW(..., CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, ...)`). SteamVR's `UpdateActionState` mutex/allocations are only touched when a bound input actually changes or during an active drag.
-- **Dashboard Input Fallback:** Resolves active bindings via `IVRInput::GetActionBindingInfo` and `GetInputSourceHandle` down to their raw shared-memory component offsets, with a `#![no_std]` double-press detector (`500 ms` window), so dragging works even when SteamVR suppresses `GetDigitalActionData` (`b_active == false`) inside the Dashboard.
-- **Safe Chaperone Commits:** Uses `IVRChaperoneSetup::ShowWorkingSetPreview()` during drags synced via `IVROverlay::WaitFrameSync()`, and debounces `CommitWorkingCopy()` by 3 seconds after release.
-
-### Project Structure
-
-- [src/main.rs](src/main.rs) — Entry point, `--poc` / `--bench` tests, and main loop.
-- [src/math.rs](src/math.rs) — 3D transforms and runtime-detected `fearless_simd` math helpers.
-- [src/state.rs](src/state.rs) — Drag state machine (single-hand lock, tracking-loss protection, zero drift).
-- [src/openvr.rs](src/openvr.rs) — Raw OpenVR FFI bindings and shared-memory input monitor.
-- [src/platform.rs](src/platform.rs) — Windows and Linux low-level OS helpers (timers, shared memory, clocks).
-- [manifest/](manifest/) — SteamVR action manifest and default controller profiles.
-
-</details>
+- [src/main.rs](src/main.rs) — `#![no_std]` entry point, `--poc` / `--bench` runners, and daemon event loop.
+- [src/state.rs](src/state.rs) — Pure state machine (`DragStateMachine`) handling anchor capture, single-hand lock, and tracking-loss recovery.
+- [src/math.rs](src/math.rs) — 3D rigid transform matrices (`HmdMatrix34_t`) and runtime-detected `fearless_simd` math helpers.
+- [src/openvr.rs](src/openvr.rs) — Raw OpenVR C ABI vtable structs, shared-memory input watcher, and binding resolver.
+- [src/platform.rs](src/platform.rs) — Windows & Linux `#![no_std]` OS layer (DLL loading, high-res timers, shared memory, monotonic clock, process stats).
+- [manifest/](manifest/) — OpenVR action manifest, `.vrmanifest`, and default bindings for supported controllers.
 
 ## License
 
