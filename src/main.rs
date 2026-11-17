@@ -426,7 +426,6 @@ fn run_daemon(simd: SimdMath) -> i32 {
     let waiter = ReactiveWaiter::new();
     let mut sm = DragStateMachine::with_simd(simd);
     let mut tick: u64 = 0;
-    let mut last_drag_release_ns: Option<u64> = None;
 
     while is_running() {
         let was_dragging = sm.is_dragging();
@@ -443,15 +442,10 @@ fn run_daemon(simd: SimdMath) -> i32 {
 
             let now_ns = clock.now_ns();
             let frame = session.sample_inputs(sm.active_device_hint(), monitor.as_mut(), now_ns);
-            match sm.step_with(frame, || session.get_working_standing_pose()) {
-                StepAction::UpdatePlayspace(m) => {
-                    last_drag_release_ns = None;
-                    session.apply_working_standing_pose(&m);
-                }
-                StepAction::CommitPlayspace(_m) => {
-                    last_drag_release_ns = Some(clock.now_ns());
-                }
-                StepAction::Idle | StepAction::AbortDrag => {}
+            if let StepAction::UpdatePlayspace(m) =
+                sm.step_with(frame, || session.get_working_standing_pose())
+            {
+                session.apply_working_standing_pose(&m);
             }
             if !sm.is_dragging() {
                 let now_ns = clock.now_ns();
@@ -486,12 +480,6 @@ fn run_daemon(simd: SimdMath) -> i32 {
         };
         let event_bindings_dirty = session.take_bindings_dirty();
         if !should_sample && !event_bindings_dirty {
-            if let Some(t_rel) = last_drag_release_ns {
-                if now_ns.saturating_sub(t_rel) >= 3_000_000_000 {
-                    session.flush_pending_commit();
-                    last_drag_release_ns = None;
-                }
-            }
             continue;
         }
 
@@ -508,24 +496,12 @@ fn run_daemon(simd: SimdMath) -> i32 {
                 monitor = None;
             }
         }
-        match sm.step_with(frame, || session.get_working_standing_pose()) {
-            StepAction::UpdatePlayspace(m) => {
-                last_drag_release_ns = None;
-                session.apply_working_standing_pose(&m);
-            }
-            StepAction::CommitPlayspace(_m) => {
-                last_drag_release_ns = Some(now_ns);
-            }
-            StepAction::Idle | StepAction::AbortDrag => {
-                if !sm.is_dragging() {
-                    if let Some(t_rel) = last_drag_release_ns {
-                        if now_ns.saturating_sub(t_rel) >= 3_000_000_000 {
-                            session.flush_pending_commit();
-                            last_drag_release_ns = None;
-                        }
-                    }
-                }
-            }
+        // Keep changes in the live working-set preview mid-session; calling CommitWorkingCopy
+        // while VR is running makes vrcompositor re-center the SteamVR Dashboard.
+        if let StepAction::UpdatePlayspace(m) =
+            sm.step_with(frame, || session.get_working_standing_pose())
+        {
+            session.apply_working_standing_pose(&m);
         }
     }
 

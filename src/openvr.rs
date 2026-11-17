@@ -544,14 +544,17 @@ impl OpenVrSession {
                         ((*self.vr_system).acknowledge_quit_exiting)();
                         should_quit = true;
                     }
-                    VR_EVENT_CHAPERONE_DATA_HAS_CHANGED
-                    | VR_EVENT_CHAPERONE_UNIVERSE_HAS_CHANGED
-                    | VR_EVENT_CHAPERONE_TEMP_DATA_HAS_CHANGED
-                    | VR_EVENT_CHAPERONE_ROOM_SETUP_COMMITTED
-                    | VR_EVENT_STANDING_ZERO_POSE_RESET => {
+                    VR_EVENT_CHAPERONE_TEMP_DATA_HAS_CHANGED => {
                         if !self.dirty_uncommitted.get() {
                             self.working_set_synced.set(false);
                         }
+                    }
+                    VR_EVENT_CHAPERONE_DATA_HAS_CHANGED
+                    | VR_EVENT_CHAPERONE_UNIVERSE_HAS_CHANGED
+                    | VR_EVENT_CHAPERONE_ROOM_SETUP_COMMITTED
+                    | VR_EVENT_STANDING_ZERO_POSE_RESET => {
+                        self.working_set_synced.set(false);
+                        self.dirty_uncommitted.set(false);
                     }
                     VR_EVENT_INPUT_BINDING_LOAD_SUCCESSFUL
                     | VR_EVENT_INPUT_ACTION_MANIFEST_RELOADED
