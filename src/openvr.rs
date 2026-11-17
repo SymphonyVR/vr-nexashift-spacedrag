@@ -2,8 +2,11 @@ use core::cell::Cell;
 use core::ffi::c_void;
 use core::mem::{MaybeUninit, size_of};
 
-use crate::math::{HmdMatrix34_t, Vec3};
-use crate::platform::{DynamicLibrary, StackBuf, resolve_action_manifest_path};
+use crate::math::{HmdMatrix34_t, SimdMath, Vec3};
+use crate::platform::{
+    DynamicLibrary, MappedReadOnlyShm, ProcessWaitHandle, StackBuf, find_connected_vrserver_shm,
+    resolve_action_manifest_path,
+};
 use crate::state::{Hand, HandInput, INVALID_DEVICE_INDEX, InputFrame};
 
 pub const K_UN_TRACKED_DEVICE_INDEX_HMD: u32 = 0;
@@ -63,6 +66,28 @@ impl Default for InputOriginInfo_t {
             device_path: 0,
             tracked_device_index: K_UN_TRACKED_DEVICE_INDEX_INVALID,
             rch_render_model_component_name: [0; 128],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InputBindingInfo_t {
+    pub rch_device_path_name: [u8; 128],
+    pub rch_input_path_name: [u8; 128],
+    pub rch_mode_name: [u8; 128],
+    pub rch_slot_name: [u8; 128],
+    pub rch_input_source_type: [u8; 32],
+}
+
+impl Default for InputBindingInfo_t {
+    fn default() -> Self {
+        Self {
+            rch_device_path_name: [0; 128],
+            rch_input_path_name: [0; 128],
+            rch_mode_name: [0; 128],
+            rch_slot_name: [0; 128],
+            rch_input_source_type: [0; 32],
         }
     }
 }
@@ -222,7 +247,13 @@ pub struct VR_IVRInput_FnTable {
         p_origin_info: *mut InputOriginInfo_t,
         un_origin_info_size: u32,
     ) -> i32,
-    pub get_action_binding_info: *const c_void,
+    pub get_action_binding_info: unsafe extern "system" fn(
+        action: u64,
+        p_origin_info: *mut InputBindingInfo_t,
+        un_binding_info_size: u32,
+        un_binding_info_count: u32,
+        pun_returned_binding_info_count: *mut u32,
+    ) -> i32,
     pub show_action_origins: *const c_void,
     pub show_bindings_for_action_set: *const c_void,
     pub get_component_state_for_binding: *const c_void,
@@ -739,6 +770,255 @@ impl OpenVrSession {
             self.dirty_uncommitted.set(false);
         }
     }
+
+    pub fn space_drag_max_component_type(&self) -> u32 {
+        if self.action_space_drag == 0 {
+            return 3;
+        }
+        let mut infos = [InputBindingInfo_t::default(); 16];
+        let mut count = 0u32;
+        let err = unsafe {
+            ((*self.vr_input).get_action_binding_info)(
+                self.action_space_drag,
+                infos.as_mut_ptr(),
+                size_of::<InputBindingInfo_t>() as u32,
+                infos.len() as u32,
+                &mut count,
+            )
+        };
+        if err != VR_INPUT_ERROR_NONE || count == 0 {
+            // Safe conservative watch (digital + scalar + vec2) if binding info isn't available yet.
+            return 3;
+        }
+        let n = (count as usize).min(infos.len());
+        let mut max_type = 1u32;
+        let mut i = 0;
+        while i < n {
+            let src_type = cstr_slice(&infos[i].rch_input_source_type);
+            let mode = cstr_slice(&infos[i].rch_mode_name);
+            let slot = cstr_slice(&infos[i].rch_slot_name);
+            let digital_slot = matches!(
+                slot,
+                b"click" | b"double" | b"touch" | b"held" | b"long" | b"force"
+            );
+            let button_mode = mode == b"button" || mode == b"toggle_button";
+            if !digital_slot && !button_mode {
+                return 3;
+            }
+            if src_type == b"trigger" || src_type == b"grip" || slot == b"pull" || slot == b"force"
+            {
+                max_type = max_type.max(2);
+            }
+            i += 1;
+        }
+        max_type
+    }
+
+    pub fn open_bare_metal_monitor(&self) -> Option<BareMetalInputMonitor> {
+        let (server_wait_handle, input_state_shm, conn_state_shm) = find_connected_vrserver_shm()?;
+        let max_watched_component_type = self.space_drag_max_component_type();
+        let mut monitor = BareMetalInputMonitor {
+            server_wait_handle,
+            input_state_shm,
+            conn_state_shm,
+            shm_valid: true,
+            last_conn_seq: 0,
+            last_component_count: 0,
+            last_active_set_count: 0,
+            max_watched_component_type,
+            grace_until_ns: 0,
+            prev_words: [0; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
+            curr_words: [0; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
+        };
+        monitor.seed_snapshot();
+        Some(monitor)
+    }
+}
+
+const SHM_MAX_COMPONENTS: usize = 512;
+const SHM_COMPONENT_WORDS: usize = 18;
+const SHM_COUNT_OFFSET: usize = 0x9000;
+const SHM_ACTIVE_SET_COUNT_OFFSET: usize = 0x9808;
+const SHM_CONN_SEQ_OFFSET: usize = 0x408;
+const POST_EDGE_GRACE_NS: u64 = 750_000_000;
+
+#[inline]
+fn cstr_slice(buf: &[u8]) -> &[u8] {
+    let mut len = 0usize;
+    while len < buf.len() && buf[len] != 0 {
+        len += 1;
+    }
+    &buf[..len]
+}
+
+#[inline]
+fn u32_18_equal(a: &[u32], b: &[u32]) -> bool {
+    let mut diff = 0u32;
+    let mut i = 0;
+    while i < SHM_COMPONENT_WORDS {
+        diff |= a[i] ^ b[i];
+        i += 1;
+    }
+    diff == 0
+}
+
+#[inline]
+fn u32_14_equal(a: &[u32], b: &[u32]) -> bool {
+    let mut diff = 0u32;
+    let mut i = 0;
+    while i < 14 {
+        diff |= a[i] ^ b[i];
+        i += 1;
+    }
+    diff == 0
+}
+
+/// Bare-metal shared-memory input watcher for `VR_InputState` & `VR_InputConnectionState`.
+///
+/// Avoids locking `VR_InputMutex` and `vrclient_x64.dll` per-frame C++ heap allocations while idle
+/// by scanning active shared-memory component slots with `fearless_simd` first.
+pub struct BareMetalInputMonitor {
+    server_wait_handle: Option<ProcessWaitHandle>,
+    input_state_shm: MappedReadOnlyShm,
+    conn_state_shm: MappedReadOnlyShm,
+    shm_valid: bool,
+    last_conn_seq: u64,
+    last_component_count: u32,
+    last_active_set_count: u32,
+    max_watched_component_type: u32,
+    grace_until_ns: u64,
+    prev_words: [u32; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
+    curr_words: [u32; SHM_MAX_COMPONENTS * SHM_COMPONENT_WORDS],
+}
+
+impl BareMetalInputMonitor {
+    #[inline]
+    pub fn vrserver_wait_handle(&self) -> Option<isize> {
+        self.server_wait_handle.as_ref().map(|h| h.raw())
+    }
+
+    #[inline]
+    pub fn extend_grace(&mut self, now_ns: u64) {
+        self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
+    }
+
+    pub fn seed_snapshot(&mut self) {
+        let Some(conn_seq) = self.conn_state_shm.read_volatile_u64(SHM_CONN_SEQ_OFFSET) else {
+            self.shm_valid = false;
+            return;
+        };
+        let Some(c1) = self.input_state_shm.read_volatile_u32(SHM_COUNT_OFFSET) else {
+            self.shm_valid = false;
+            return;
+        };
+        let Some(c2) = self
+            .input_state_shm
+            .read_volatile_u32(SHM_ACTIVE_SET_COUNT_OFFSET)
+        else {
+            self.shm_valid = false;
+            return;
+        };
+        if (c1 as usize) > SHM_MAX_COMPONENTS || c2 > 128 {
+            self.shm_valid = false;
+            return;
+        }
+        let words = (c1 as usize) * SHM_COMPONENT_WORDS;
+        if words > 0 && !self.input_state_shm.copy_volatile_u32_words(0, &mut self.prev_words[..words])
+        {
+            self.shm_valid = false;
+            return;
+        }
+        self.last_conn_seq = conn_seq;
+        self.last_component_count = c1;
+        self.last_active_set_count = c2;
+    }
+
+    /// Checks SteamVR shared memory via SIMD. Returns `(should_sample_openvr, bindings_changed)`.
+    pub fn poll_should_sample(&mut self, simd: SimdMath, now_ns: u64) -> (bool, bool) {
+        if !self.shm_valid {
+            return (true, false);
+        }
+
+        let Some(conn_seq) = self.conn_state_shm.read_volatile_u64(SHM_CONN_SEQ_OFFSET) else {
+            self.shm_valid = false;
+            return (true, false);
+        };
+        let Some(c1) = self.input_state_shm.read_volatile_u32(SHM_COUNT_OFFSET) else {
+            self.shm_valid = false;
+            return (true, false);
+        };
+        let Some(c2) = self
+            .input_state_shm
+            .read_volatile_u32(SHM_ACTIVE_SET_COUNT_OFFSET)
+        else {
+            self.shm_valid = false;
+            return (true, false);
+        };
+        if (c1 as usize) > SHM_MAX_COMPONENTS || c2 > 128 {
+            self.shm_valid = false;
+            return (true, false);
+        }
+
+        let conn_changed = conn_seq != self.last_conn_seq;
+        let words = (c1 as usize) * SHM_COMPONENT_WORDS;
+        if words > 0
+            && !self
+                .input_state_shm
+                .copy_volatile_u32_words(0, &mut self.curr_words[..words])
+        {
+            self.shm_valid = false;
+            return (true, false);
+        }
+
+        if !conn_changed
+            && c1 == self.last_component_count
+            && c2 == self.last_active_set_count
+            && simd.slices_equal_u32(&self.curr_words[..words], &self.prev_words[..words])
+        {
+            return (now_ns < self.grace_until_ns, false);
+        }
+
+        let meta_count_changed =
+            conn_changed || c1 != self.last_component_count || c2 != self.last_active_set_count;
+        self.last_conn_seq = conn_seq;
+        self.last_component_count = c1;
+        self.last_active_set_count = c2;
+
+        if meta_count_changed {
+            self.prev_words[..words].copy_from_slice(&self.curr_words[..words]);
+            self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
+            return (true, conn_changed);
+        }
+
+        let mut watched_changed = false;
+        let mut idx = 0usize;
+        while idx < words {
+            let new_slot = &self.curr_words[idx..idx + SHM_COMPONENT_WORDS];
+            let old_slot = &self.prev_words[idx..idx + SHM_COMPONENT_WORDS];
+            if !u32_18_equal(old_slot, new_slot) {
+                let comp_type = new_slot[0];
+                if !u32_14_equal(old_slot, new_slot)
+                    || comp_type <= self.max_watched_component_type
+                {
+                    watched_changed = true;
+                }
+            }
+            idx += SHM_COMPONENT_WORDS;
+        }
+        self.prev_words[..words].copy_from_slice(&self.curr_words[..words]);
+
+        if watched_changed {
+            self.grace_until_ns = now_ns.saturating_add(POST_EDGE_GRACE_NS);
+            (true, false)
+        } else {
+            (now_ns < self.grace_until_ns, false)
+        }
+    }
+
+    #[inline]
+    pub fn set_max_watched_component_type(&mut self, max_type: u32) {
+        self.max_watched_component_type = max_type.clamp(1, 3);
+    }
 }
 
 impl Drop for OpenVrSession {
@@ -760,6 +1040,7 @@ mod tests {
         assert_eq!(size_of::<TrackedDevicePose_t>(), 80);
         assert_eq!(size_of::<InputDigitalActionData_t>(), 24);
         assert_eq!(size_of::<InputOriginInfo_t>(), 144);
+        assert_eq!(size_of::<InputBindingInfo_t>(), 544);
         assert_eq!(size_of::<VRActiveActionSet_t>(), 32);
         #[cfg(target_os = "linux")]
         assert_eq!(size_of::<VREvent_t>(), 60);

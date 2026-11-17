@@ -70,9 +70,17 @@ impl<const N: usize> Write for StackBuf<N> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessStats {
     pub cpu_time_ns: u64,
+    pub cpu_cycles: u64,
     pub private_bytes: u64,
     pub write_bytes: u64,
     pub write_ops: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Tick,
+    Stop,
+    ServerExited,
 }
 
 /// Extracts the first string entry inside `<key> : [ "..." ]` of SteamVR's
@@ -185,6 +193,7 @@ fn pop_path_component(path: &[u8]) -> &[u8] {
 mod imp {
     use super::*;
 
+    use core::cell::Cell;
     use core::sync::atomic::AtomicIsize;
 
     const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
@@ -197,6 +206,13 @@ mod imp {
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
     const INVALID_HANDLE_VALUE: isize = -1;
     const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+    const WAIT_OBJECT_0: u32 = 0;
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+    const FILE_MAP_READ: u32 = 0x0004;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 
     static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 
@@ -253,6 +269,38 @@ mod imp {
         other_transfer_count: u64,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub(super) struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    impl Default for ProcessEntry32W {
+        fn default() -> Self {
+            Self {
+                dw_size: core::mem::size_of::<Self>() as u32,
+                cnt_usage: 0,
+                th32_process_id: 0,
+                th32_default_heap_id: 0,
+                th32_module_id: 0,
+                cnt_threads: 0,
+                th32_parent_process_id: 0,
+                pc_pri_class_base: 0,
+                dw_flags: 0,
+                sz_exe_file: [0; 260],
+            }
+        }
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetStdHandle(nStdHandle: u32) -> isize;
@@ -304,11 +352,49 @@ mod imp {
         ) -> isize;
         fn SetEvent(hEvent: isize) -> i32;
         fn WaitForSingleObject(hHandle: isize, dwMilliseconds: u32) -> u32;
+        fn WaitForMultipleObjects(
+            nCount: u32,
+            lpHandles: *const isize,
+            bWaitAll: i32,
+            dwMilliseconds: u32,
+        ) -> u32;
+        fn CreateWaitableTimerExW(
+            lpTimerAttributes: *const c_void,
+            lpTimerName: *const u16,
+            dwFlags: u32,
+            dwDesiredAccess: u32,
+        ) -> isize;
+        fn SetWaitableTimer(
+            hTimer: isize,
+            lpDueTime: *const i64,
+            lPeriod: i32,
+            pfnCompletionRoutine: *const c_void,
+            lpArgToCompletionRoutine: *const c_void,
+            fResume: i32,
+        ) -> i32;
+        fn CancelWaitableTimer(hTimer: isize) -> i32;
+        fn OpenFileMappingW(dwDesiredAccess: u32, bInheritHandle: i32, lpName: *const u16)
+            -> isize;
+        fn MapViewOfFile(
+            hFileMappingObject: isize,
+            dwDesiredAccess: u32,
+            dwFileOffsetHigh: u32,
+            dwFileOffsetLow: u32,
+            dwNumberOfBytesToMap: usize,
+        ) -> *const c_void;
+        fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> i32;
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn GetCurrentProcessId() -> u32;
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> isize;
+        fn Process32FirstW(hSnapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(hSnapshot: isize, lppe: *mut ProcessEntry32W) -> i32;
         fn SetConsoleCtrlHandler(
             handlerRoutine: Option<unsafe extern "system" fn(u32) -> i32>,
             add: i32,
         ) -> i32;
         fn GetCurrentProcess() -> isize;
+        fn GetCurrentThread() -> isize;
+        fn QueryThreadCycleTime(ThreadHandle: isize, CycleTime: *mut u64) -> i32;
         fn GetProcessTimes(
             hProcess: isize,
             lpCreationTime: *mut FileTime,
@@ -417,6 +503,8 @@ mod imp {
 
     pub struct ReactiveWaiter {
         event_handle: isize,
+        timer_handle: isize,
+        armed_period_ms: Cell<u32>,
     }
 
     impl ReactiveWaiter {
@@ -430,7 +518,24 @@ mod imp {
                     }
                 }
             }
-            Self { event_handle: h }
+            let mut timer = unsafe {
+                CreateWaitableTimerExW(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            if timer == 0 {
+                timer = unsafe {
+                    CreateWaitableTimerExW(core::ptr::null(), core::ptr::null(), 0, TIMER_ALL_ACCESS)
+                };
+            }
+            Self {
+                event_handle: h,
+                timer_handle: timer,
+                armed_period_ms: Cell::new(0),
+            }
         }
 
         #[inline]
@@ -441,10 +546,89 @@ mod imp {
                 }
             }
         }
+
+        #[inline]
+        pub fn disarm_idle_timer(&self) {
+            if self.timer_handle != 0 && self.armed_period_ms.get() != 0 {
+                unsafe {
+                    let _ = CancelWaitableTimer(self.timer_handle);
+                }
+                self.armed_period_ms.set(0);
+            }
+        }
+
+        #[inline]
+        pub fn wait_idle_tick(&self, watch_handle: Option<isize>, period_ms: u32) -> WaitOutcome {
+            if !is_running() {
+                return WaitOutcome::Stop;
+            }
+            let period_ms = period_ms.max(1);
+            if self.timer_handle == 0 || self.event_handle == 0 {
+                self.wait_stop_or_timeout_ms(period_ms);
+                if !is_running() {
+                    return WaitOutcome::Stop;
+                }
+                if let Some(wh) = watch_handle {
+                    if wh != 0 && unsafe { WaitForSingleObject(wh, 0) } == WAIT_OBJECT_0 {
+                        return WaitOutcome::ServerExited;
+                    }
+                }
+                return WaitOutcome::Tick;
+            }
+
+            if self.armed_period_ms.get() != period_ms {
+                let due: i64 = -(period_ms as i64) * 10_000;
+                let ok = unsafe {
+                    SetWaitableTimer(
+                        self.timer_handle,
+                        &due,
+                        period_ms as i32,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        0,
+                    )
+                };
+                if ok != 0 {
+                    self.armed_period_ms.set(period_ms);
+                }
+            }
+
+            let mut handles = [self.event_handle, self.timer_handle, 0isize];
+            let count = if let Some(wh) = watch_handle {
+                if wh != 0 {
+                    handles[2] = wh;
+                    3u32
+                } else {
+                    2u32
+                }
+            } else {
+                2u32
+            };
+
+            let res = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, INFINITE) };
+            match res {
+                r if r == WAIT_OBJECT_0 => WaitOutcome::Stop,
+                r if r == WAIT_OBJECT_0 + 1 => WaitOutcome::Tick,
+                r if count == 3 && r == WAIT_OBJECT_0 + 2 => WaitOutcome::ServerExited,
+                _ => {
+                    if is_running() {
+                        WaitOutcome::Tick
+                    } else {
+                        WaitOutcome::Stop
+                    }
+                }
+            }
+        }
     }
 
     impl Drop for ReactiveWaiter {
         fn drop(&mut self) {
+            self.disarm_idle_timer();
+            if self.timer_handle != 0 {
+                unsafe {
+                    let _ = CloseHandle(self.timer_handle);
+                }
+            }
             if self.event_handle != 0 {
                 let _ = STOP_EVENT.compare_exchange(
                     self.event_handle,
@@ -457,6 +641,184 @@ mod imp {
                 }
             }
         }
+    }
+
+    pub struct MappedReadOnlyShm {
+        map_handle: isize,
+        view: *const u8,
+        len: usize,
+    }
+
+    impl MappedReadOnlyShm {
+        pub fn open_utf8(name_nul: &[u8], len: usize) -> Option<Self> {
+            let mut wide = [0u16; 260];
+            utf8_nul_to_utf16(name_nul, &mut wide)?;
+            let map_handle = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
+            if map_handle == 0 {
+                return None;
+            }
+            let view = unsafe { MapViewOfFile(map_handle, FILE_MAP_READ, 0, 0, len) } as *const u8;
+            if view.is_null() {
+                unsafe {
+                    let _ = CloseHandle(map_handle);
+                }
+                return None;
+            }
+            Some(Self {
+                map_handle,
+                view,
+                len,
+            })
+        }
+
+        #[inline]
+        pub fn read_volatile_u32(&self, byte_offset: usize) -> Option<u32> {
+            if byte_offset.checked_add(4)? > self.len {
+                return None;
+            }
+            let ptr = unsafe { self.view.add(byte_offset) } as *const u32;
+            Some(unsafe { core::ptr::read_volatile(ptr) })
+        }
+
+        #[inline]
+        pub fn read_volatile_u64(&self, byte_offset: usize) -> Option<u64> {
+            if byte_offset.checked_add(8)? > self.len {
+                return None;
+            }
+            let ptr = unsafe { self.view.add(byte_offset) } as *const u64;
+            Some(unsafe { core::ptr::read_volatile(ptr) })
+        }
+
+        #[inline]
+        pub fn copy_volatile_u32_words(&self, byte_offset: usize, dst: &mut [u32]) -> bool {
+            let Some(byte_len) = dst.len().checked_mul(4) else {
+                return false;
+            };
+            let Some(end) = byte_offset.checked_add(byte_len) else {
+                return false;
+            };
+            if end > self.len {
+                return false;
+            }
+            let src_ptr = unsafe { self.view.add(byte_offset) } as *const u32;
+            let mut i = 0usize;
+            while i < dst.len() {
+                dst[i] = unsafe { core::ptr::read_volatile(src_ptr.add(i)) };
+                i += 1;
+            }
+            true
+        }
+    }
+
+    impl Drop for MappedReadOnlyShm {
+        fn drop(&mut self) {
+            if !self.view.is_null() {
+                unsafe {
+                    let _ = UnmapViewOfFile(self.view.cast());
+                }
+            }
+            if self.map_handle != 0 {
+                unsafe {
+                    let _ = CloseHandle(self.map_handle);
+                }
+            }
+        }
+    }
+
+    pub struct ProcessWaitHandle {
+        handle: isize,
+    }
+
+    impl ProcessWaitHandle {
+        pub fn open_sync(pid: u32) -> Option<Self> {
+            let h = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+            if h != 0 {
+                Some(Self { handle: h })
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        pub fn raw(&self) -> isize {
+            self.handle
+        }
+    }
+
+    impl Drop for ProcessWaitHandle {
+        fn drop(&mut self) {
+            if self.handle != 0 {
+                unsafe {
+                    let _ = CloseHandle(self.handle);
+                }
+            }
+        }
+    }
+
+    fn utf16_eq_ascii_ignore_case(wide: &[u16], ascii: &[u8]) -> bool {
+        let mut len = 0usize;
+        while len < wide.len() && wide[len] != 0 {
+            len += 1;
+        }
+        if len != ascii.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < len {
+            let w = wide[i];
+            if w > 0x7F {
+                return false;
+            }
+            let a = (w as u8).to_ascii_lowercase();
+            let b = ascii[i].to_ascii_lowercase();
+            if a != b {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    pub fn find_connected_vrserver_shm(
+    ) -> Option<(Option<ProcessWaitHandle>, MappedReadOnlyShm, MappedReadOnlyShm)> {
+        let self_pid = unsafe { GetCurrentProcessId() };
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE || snap == 0 {
+            return None;
+        }
+
+        let mut entry = ProcessEntry32W::default();
+        let mut found = None;
+        let mut has_item = unsafe { Process32FirstW(snap, &mut entry) != 0 };
+        while has_item {
+            if utf16_eq_ascii_ignore_case(&entry.sz_exe_file, b"vrserver.exe") {
+                let server_pid = entry.th32_process_id;
+                let mut conn_name = StackBuf::<128>::new();
+                let _ = write!(
+                    conn_name,
+                    "VR_InputConnectionState_{}_{}-IPCWrapper\0",
+                    self_pid, server_pid
+                );
+                let mut state_name = StackBuf::<128>::new();
+                let _ = write!(state_name, "VR_InputState_{}-IPCWrapper\0", server_pid);
+
+                if let (Some(conn_shm), Some(state_shm)) = (
+                    MappedReadOnlyShm::open_utf8(conn_name.as_bytes(), 0x420),
+                    MappedReadOnlyShm::open_utf8(state_name.as_bytes(), 0x9810),
+                ) {
+                    let wait_handle = ProcessWaitHandle::open_sync(server_pid);
+                    found = Some((wait_handle, state_shm, conn_shm));
+                    break;
+                }
+            }
+            entry.dw_size = core::mem::size_of::<ProcessEntry32W>() as u32;
+            has_item = unsafe { Process32NextW(snap, &mut entry) != 0 };
+        }
+
+        unsafe {
+            let _ = CloseHandle(snap);
+        }
+        found
     }
 
     pub struct DynamicLibrary {
@@ -636,6 +998,11 @@ mod imp {
             let mut user = FileTime::default();
             if GetProcessTimes(proc_handle, &mut create, &mut exit, &mut kernel, &mut user) != 0 {
                 stats.cpu_time_ns = kernel.to_ns().saturating_add(user.to_ns());
+            }
+
+            let mut cycles = 0u64;
+            if QueryThreadCycleTime(GetCurrentThread(), &mut cycles) != 0 {
+                stats.cpu_cycles = cycles;
             }
 
             let mut mem = ProcessMemoryCountersEx::default();
@@ -997,6 +1364,61 @@ mod imp {
                 }
             }
         }
+
+        #[inline]
+        pub fn disarm_idle_timer(&self) {}
+
+        #[inline]
+        pub fn wait_idle_tick(&self, _watch_handle: Option<isize>, period_ms: u32) -> WaitOutcome {
+            if !is_running() {
+                return WaitOutcome::Stop;
+            }
+            if self.read_fd >= 0 {
+                let mut pfd = PollFd {
+                    fd: self.read_fd,
+                    events: POLLIN,
+                    revents: 0,
+                };
+                let ret = unsafe { poll(&mut pfd, 1, period_ms as i32) };
+                if !is_running() || (ret > 0 && (pfd.revents & POLLIN) != 0) {
+                    return WaitOutcome::Stop;
+                }
+            }
+            WaitOutcome::Tick
+        }
+    }
+
+    pub struct MappedReadOnlyShm;
+
+    impl MappedReadOnlyShm {
+        #[inline]
+        pub fn read_volatile_u32(&self, _byte_offset: usize) -> Option<u32> {
+            None
+        }
+
+        #[inline]
+        pub fn read_volatile_u64(&self, _byte_offset: usize) -> Option<u64> {
+            None
+        }
+
+        #[inline]
+        pub fn copy_volatile_u32_words(&self, _byte_offset: usize, _dst: &mut [u32]) -> bool {
+            false
+        }
+    }
+
+    pub struct ProcessWaitHandle;
+
+    impl ProcessWaitHandle {
+        #[inline]
+        pub fn raw(&self) -> isize {
+            0
+        }
+    }
+
+    pub fn find_connected_vrserver_shm(
+    ) -> Option<(Option<ProcessWaitHandle>, MappedReadOnlyShm, MappedReadOnlyShm)> {
+        None
     }
 
     impl Drop for ReactiveWaiter {
@@ -1299,14 +1721,21 @@ mod imp {
 }
 
 pub use imp::{
-    DynamicLibrary, MonotonicClock, ReactiveWaiter, abort, command_line_has_flag, exit_process,
-    install_signal_handlers, load_openvr_library, query_chaperone_file_stamp, query_process_stats,
+    DynamicLibrary, MappedReadOnlyShm, MonotonicClock, ProcessWaitHandle, ReactiveWaiter, abort,
+    command_line_has_flag, exit_process, find_connected_vrserver_shm, install_signal_handlers,
+    load_openvr_library, query_chaperone_file_stamp, query_process_stats,
     resolve_action_manifest_path, write_stderr, write_stdout,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_process_entry32w_size() {
+        assert_eq!(core::mem::size_of::<imp::ProcessEntry32W>(), 568);
+    }
 
     #[test]
     fn parses_vrpath_runtime_and_config_windows_and_linux() {

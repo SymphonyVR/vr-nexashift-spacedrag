@@ -6,8 +6,9 @@ use core::fmt::Write;
 use nexashift::math::{HmdMatrix34_t, SimdMath, Vec3};
 use nexashift::openvr::{OpenVrError, OpenVrSession};
 use nexashift::platform::{
-    MonotonicClock, ReactiveWaiter, StackBuf, command_line_has_flag, install_signal_handlers,
-    is_running, query_chaperone_file_stamp, query_process_stats, write_stderr, write_stdout,
+    MonotonicClock, ReactiveWaiter, StackBuf, WaitOutcome, command_line_has_flag,
+    install_signal_handlers, is_running, query_chaperone_file_stamp, query_process_stats,
+    write_stderr, write_stdout,
 };
 use nexashift::state::{DragPhase, DragStateMachine, HandInput, InputFrame, StepAction};
 
@@ -83,6 +84,13 @@ fn wait_next_vr_frame(session: &OpenVrSession, waiter: &ReactiveWaiter) {
     if !session.wait_frame_sync(100) && is_running() {
         waiter.wait_stop_or_timeout_ms(100);
     }
+}
+
+#[inline]
+fn idle_period_ms_for_hmd(hz: f32) -> u32 {
+    let raw = (1000.0f32 / hz) + 0.5;
+    let ms = raw as u32;
+    ms.clamp(8, 12)
 }
 
 fn run_poc(simd: SimdMath) -> i32 {
@@ -210,33 +218,60 @@ fn run_bench(simd: SimdMath) -> i32 {
         }
     };
 
+    let _ = session.sample_inputs(None);
+    let mut monitor = session.open_bare_metal_monitor();
+    let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
+
     print_out(format_args!(
-        "bench[init]: simd={}, hmd_hz={}\n",
+        "bench[init]: simd={}, hmd_hz={}, shm={}, idle_period_ms={}\n",
         simd.level_name(),
-        session.hmd_refresh_hz() as u32
+        session.hmd_refresh_hz() as u32,
+        monitor.is_some(),
+        idle_period_ms
     ));
 
     let clock = MonotonicClock::new();
     let waiter = ReactiveWaiter::new();
     let mut sm = DragStateMachine::with_simd(simd);
+    let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
 
-    // 1. Idle benchmark (5 seconds at low-power ~30 Hz reactive wakeups).
+    // 1. Bare-metal idle benchmark (5 seconds at native VR frame rate via high-res timer + SIMD SHM watch).
     let bench_duration_ns: u64 = 5_000_000_000;
     let idle_chap_before = query_chaperone_file_stamp();
     let idle_start_stats = query_process_stats();
     let idle_t0 = clock.now_ns();
     let mut idle_wakeups: u64 = 0;
 
-    while is_running() && clock.now_ns().saturating_sub(idle_t0) < bench_duration_ns {
-        waiter.wait_stop_or_timeout_ms(33);
-        if !is_running() || ((idle_wakeups & 15) == 0 && session.poll_should_quit()) {
+    while is_running() {
+        let now_ns = clock.now_ns();
+        if now_ns.saturating_sub(idle_t0) >= bench_duration_ns {
             break;
         }
-        let frame = session.sample_inputs(sm.active_device_hint());
-        let _ = sm.step_with(frame, || session.get_working_standing_pose());
+        match waiter.wait_idle_tick(watch_handle, idle_period_ms) {
+            WaitOutcome::Tick => {}
+            WaitOutcome::Stop | WaitOutcome::ServerExited => break,
+        }
+        if (idle_wakeups & 63) == 0 && session.poll_should_quit() {
+            break;
+        }
+        let now_ns = clock.now_ns();
+        let (should_sample, bindings_changed) = match monitor.as_mut() {
+            Some(m) => m.poll_should_sample(simd, now_ns),
+            None => (true, false),
+        };
+        if should_sample {
+            let frame = session.sample_inputs(sm.active_device_hint());
+            let _ = sm.step_with(frame, || session.get_working_standing_pose());
+            if bindings_changed {
+                if let Some(m) = monitor.as_mut() {
+                    m.set_max_watched_component_type(session.space_drag_max_component_type());
+                }
+            }
+        }
         idle_wakeups += 1;
     }
 
+    waiter.disarm_idle_timer();
     let idle_wall_ns = clock.now_ns().saturating_sub(idle_t0).max(1);
     let idle_end_stats = query_process_stats();
     let idle_chap_after = query_chaperone_file_stamp();
@@ -244,6 +279,10 @@ fn run_bench(simd: SimdMath) -> i32 {
     let idle_cpu_ns = idle_end_stats
         .cpu_time_ns
         .saturating_sub(idle_start_stats.cpu_time_ns);
+    let idle_cycles = idle_end_stats
+        .cpu_cycles
+        .saturating_sub(idle_start_stats.cpu_cycles);
+    let idle_mcyc_s = (idle_cycles as f64) * 1_000.0 / (idle_wall_ns as f64);
     let idle_cpu_pct_1core = (idle_cpu_ns as f64) * 100.0 / (idle_wall_ns as f64);
     let idle_cpu_pct_12t = idle_cpu_pct_1core / 12.0;
     let idle_wakeups_sec = (idle_wakeups as f64) * 1_000_000_000.0 / (idle_wall_ns as f64);
@@ -252,10 +291,11 @@ fn run_bench(simd: SimdMath) -> i32 {
         .saturating_sub(idle_start_stats.write_bytes);
 
     print_out(format_args!(
-        "bench[idle]: wall_ms={:.1}, wakeups={} ({:.1}/s), cpu_ms={:.3}, cpu_1core={:.4}%, cpu_12t={:.4}%, private_kb={}, ipc_write_bytes={}, chaperone_modified={}\n",
+        "bench[idle]: wall_ms={:.1}, wakeups={} ({:.1}/s), Mcycles/s={:.2}, cpu_ms={:.3}, cpu_1core={:.4}%, cpu_12t={:.4}%, private_kb={}, ipc_write_bytes={}, chaperone_modified={}\n",
         idle_wall_ns as f64 / 1_000_000.0,
         idle_wakeups,
         idle_wakeups_sec,
+        idle_mcyc_s,
         idle_cpu_ns as f64 / 1_000_000.0,
         idle_cpu_pct_1core,
         idle_cpu_pct_12t,
@@ -368,6 +408,11 @@ fn run_daemon(simd: SimdMath) -> i32 {
         }
     };
 
+    let _ = session.sample_inputs(None);
+    let mut monitor = session.open_bare_metal_monitor();
+    let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
+    let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
+
     let clock = MonotonicClock::new();
     let waiter = ReactiveWaiter::new();
     let mut sm = DragStateMachine::with_simd(simd);
@@ -375,34 +420,82 @@ fn run_daemon(simd: SimdMath) -> i32 {
     let mut last_drag_release_ns: Option<u64> = None;
 
     while is_running() {
-        if sm.is_dragging() {
+        let was_dragging = sm.is_dragging();
+        if was_dragging {
+            waiter.disarm_idle_timer();
             wait_next_vr_frame(&session, &waiter);
-        } else {
-            waiter.wait_stop_or_timeout_ms(33);
-        }
-        if !is_running() {
-            break;
+            if !is_running() {
+                break;
+            }
+            if (tick & 31) == 0 && session.poll_should_quit() {
+                break;
+            }
+            tick = tick.wrapping_add(1);
+
+            let frame = session.sample_inputs(sm.active_device_hint());
+            match sm.step_with(frame, || session.get_working_standing_pose()) {
+                StepAction::UpdatePlayspace(m) => {
+                    last_drag_release_ns = None;
+                    session.apply_working_standing_pose(&m);
+                }
+                StepAction::CommitPlayspace(_m) => {
+                    last_drag_release_ns = Some(clock.now_ns());
+                }
+                StepAction::Idle | StepAction::AbortDrag => {}
+            }
+            if !sm.is_dragging() {
+                let now_ns = clock.now_ns();
+                if let Some(m) = monitor.as_mut() {
+                    m.extend_grace(now_ns);
+                    m.seed_snapshot();
+                }
+            }
+            continue;
         }
 
-        let poll_mask = if sm.is_dragging() { 31 } else { 15 };
-        if (tick & poll_mask) == 0 && session.poll_should_quit() {
+        match waiter.wait_idle_tick(watch_handle, idle_period_ms) {
+            WaitOutcome::Tick => {}
+            WaitOutcome::Stop | WaitOutcome::ServerExited => break,
+        }
+        if (tick & 63) == 0 && session.poll_should_quit() {
             break;
         }
         tick = tick.wrapping_add(1);
 
+        let now_ns = clock.now_ns();
+        let (should_sample, bindings_changed) = match monitor.as_mut() {
+            Some(m) => m.poll_should_sample(simd, now_ns),
+            None => (true, false),
+        };
+        if !should_sample {
+            if let Some(t_rel) = last_drag_release_ns {
+                if now_ns.saturating_sub(t_rel) >= 3_000_000_000 {
+                    session.flush_pending_commit();
+                    last_drag_release_ns = None;
+                }
+            }
+            continue;
+        }
+
         let frame = session.sample_inputs(sm.active_device_hint());
+        if bindings_changed {
+            if let Some(m) = monitor.as_mut() {
+                m.set_max_watched_component_type(session.space_drag_max_component_type());
+                m.seed_snapshot();
+            }
+        }
         match sm.step_with(frame, || session.get_working_standing_pose()) {
             StepAction::UpdatePlayspace(m) => {
                 last_drag_release_ns = None;
                 session.apply_working_standing_pose(&m);
             }
             StepAction::CommitPlayspace(_m) => {
-                last_drag_release_ns = Some(clock.now_ns());
+                last_drag_release_ns = Some(now_ns);
             }
             StepAction::Idle | StepAction::AbortDrag => {
                 if !sm.is_dragging() {
                     if let Some(t_rel) = last_drag_release_ns {
-                        if clock.now_ns().saturating_sub(t_rel) >= 3_000_000_000 {
+                        if now_ns.saturating_sub(t_rel) >= 3_000_000_000 {
                             session.flush_pending_commit();
                             last_drag_release_ns = None;
                         }
@@ -412,6 +505,7 @@ fn run_daemon(simd: SimdMath) -> i32 {
         }
     }
 
+    waiter.disarm_idle_timer();
     if let DragPhase::Dragging {
         moved: true,
         last_m,

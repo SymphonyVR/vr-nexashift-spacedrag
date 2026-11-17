@@ -347,6 +347,45 @@ fn raw_to_standing_point_simd<S: Simd>(
     Vec3::new(acc[0], acc[1], acc[2])
 }
 
+#[inline(always)]
+fn slices_equal_u32_simd<S: Simd>(simd: S, a: &[u32], b: &[u32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let lanes = S::u32s::LEN;
+    let chunks_a = a.chunks_exact(lanes);
+    let chunks_b = b.chunks_exact(lanes);
+    let rem_a = chunks_a.remainder();
+    let rem_b = chunks_b.remainder();
+
+    let mut diff_acc = S::u32s::splat(simd, 0);
+    for (ca, cb) in chunks_a.zip(chunks_b) {
+        let va = S::u32s::from_slice(simd, ca);
+        let vb = S::u32s::from_slice(simd, cb);
+        diff_acc = diff_acc | (va ^ vb);
+    }
+
+    let mut tail_diff = 0u32;
+    let mut i = 0;
+    while i < rem_a.len() {
+        tail_diff |= rem_a[i] ^ rem_b[i];
+        i += 1;
+    }
+    if tail_diff != 0 {
+        return false;
+    }
+
+    let mut lane_buf = [0u32; 16];
+    diff_acc.store_slice(&mut lane_buf[..lanes]);
+    let mut acc = 0u32;
+    let mut k = 0;
+    while k < lanes {
+        acc |= lane_buf[k];
+        k += 1;
+    }
+    acc == 0
+}
+
 /// Startup-resolved SIMD math table using `fearless_simd` with zero runtime static cache.
 #[derive(Clone, Copy)]
 pub struct SimdMath {
@@ -355,6 +394,7 @@ pub struct SimdMath {
     raw_to_standing_point_fn: fn(&HmdMatrix34_t, Vec3) -> Vec3,
     sub_vec3_fn: fn(Vec3, Vec3) -> Vec3,
     add_vec3_fn: fn(Vec3, Vec3) -> Vec3,
+    slices_equal_u32_fn: fn(&[u32], &[u32]) -> bool,
 }
 
 impl SimdMath {
@@ -395,12 +435,18 @@ impl SimdMath {
             s.vectorize(#[inline(always)] || add_vec3_simd(s, a, b))
         }
 
+        fn slices_equal_u32_impl<S: Simd>(a: &[u32], b: &[u32]) -> bool {
+            let s: S = unsafe { core::mem::MaybeUninit::uninit().assume_init() };
+            s.vectorize(#[inline(always)] || slices_equal_u32_simd(s, a, b))
+        }
+
         Self {
             level: simd.level(),
             apply_raw_translation_fn: apply_impl::<S>,
             raw_to_standing_point_fn: raw_to_standing_impl::<S>,
             sub_vec3_fn: sub_impl::<S>,
             add_vec3_fn: add_impl::<S>,
+            slices_equal_u32_fn: slices_equal_u32_impl::<S>,
         }
     }
 
@@ -443,6 +489,11 @@ impl SimdMath {
     #[inline]
     pub fn add_vec3(&self, a: Vec3, b: Vec3) -> Vec3 {
         (self.add_vec3_fn)(a, b)
+    }
+
+    #[inline]
+    pub fn slices_equal_u32(&self, a: &[u32], b: &[u32]) -> bool {
+        (self.slices_equal_u32_fn)(a, b)
     }
 }
 
@@ -663,5 +714,29 @@ mod tests {
             via_inverse,
             direct
         );
+    }
+
+    #[test]
+    fn simd_slices_equal_u32_detects_single_bit_flips_across_lengths() {
+        let simd = SimdMath::new_detected();
+        let baseline = SimdMath::with_level(Level::baseline());
+        assert!(simd.slices_equal_u32(&[], &[]));
+        assert!(baseline.slices_equal_u32(&[], &[]));
+
+        let a = [0x1122_3344u32; 1117];
+        let mut b = a;
+        assert!(simd.slices_equal_u32(&a, &b));
+        assert!(baseline.slices_equal_u32(&a, &b));
+        assert!(!simd.slices_equal_u32(&a[..100], &b[..99]));
+
+        for idx in [0usize, 1, 7, 8, 15, 16, 17, 555, 1115, 1116] {
+            b[idx] ^= 1;
+            assert!(!simd.slices_equal_u32(&a, &b), "simd missed flip at {idx}");
+            assert!(
+                !baseline.slices_equal_u32(&a, &b),
+                "baseline missed flip at {idx}"
+            );
+            b[idx] = a[idx];
+        }
     }
 }
