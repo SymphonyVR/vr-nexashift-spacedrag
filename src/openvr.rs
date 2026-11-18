@@ -394,32 +394,6 @@ impl OpenVrSession {
         let vr_overlay = get_table(b"FnTable:IVROverlay_026\0", "IVROverlay_026")?
             as *const VR_IVROverlay_FnTable;
 
-        let mut err = VR_INIT_ERROR_NONE;
-        let settings_ptr =
-            unsafe { fn_get_interface(b"FnTable:IVRSettings_003\0".as_ptr(), &mut err) };
-        if settings_ptr != 0 && err == VR_INIT_ERROR_NONE {
-            let vr_settings = settings_ptr as *const VR_IVRSettings_FnTable;
-            let mut s_err = 0i32;
-            let enabled = unsafe {
-                ((*vr_settings).get_bool)(
-                    b"steamvr\0".as_ptr(),
-                    b"globalActionSetPriority\0".as_ptr(),
-                    &mut s_err,
-                )
-            };
-            if s_err != 0 || !enabled {
-                s_err = 0;
-                unsafe {
-                    ((*vr_settings).set_bool)(
-                        b"steamvr\0".as_ptr(),
-                        b"globalActionSetPriority\0".as_ptr(),
-                        true,
-                        &mut s_err,
-                    );
-                }
-            }
-        }
-
         let mut action_set_main = 0u64;
         let mut action_space_drag = 0u64;
         let mut source_left = 0u64;
@@ -589,12 +563,14 @@ impl OpenVrSession {
         mut monitor: Option<&mut BareMetalInputMonitor>,
         now_ns: u64,
     ) -> InputFrame {
+        // Keep priority at 0 so SteamVR never inserts our bindings into globalPriorityMap and
+        // never blocks foreground games (e.g. VRChat B/Y/Joystick) from receiving input.
         let mut active_set = VRActiveActionSet_t {
             ul_action_set: self.action_set_main,
             ul_restricted_to_device: 0,
             ul_secondary_action_set: 0,
             un_padding: 0,
-            n_priority: K_N_ACTION_SET_OVERLAY_GLOBAL_PRIORITY_MAX,
+            n_priority: 0,
         };
         let err = unsafe {
             ((*self.vr_input).update_action_state)(
@@ -972,6 +948,8 @@ impl DoubleClickDetector {
         self.prev_raw = raw;
         if !raw {
             self.latched_double = false;
+            self.awaiting_second = false;
+            self.last_first_press_ns = 0;
         }
     }
 }

@@ -189,6 +189,12 @@ impl DragStateMachine {
                 }
 
                 let delta = self.simd.sub_vec3(active.position_raw, c0);
+                // Ignore sub-2mm tremor before the drag actually starts so a quick tap
+                // never attaches a live working-set preview to SteamVR.
+                let delta_sq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                if !moved && delta_sq < (0.002 * 0.002) {
+                    return StepAction::Idle;
+                }
                 let m_new = self.simd.apply_raw_translation(&m0, delta);
                 self.phase = DragPhase::Dragging {
                     hand,
@@ -521,5 +527,30 @@ mod tests {
         };
         assert_eq!(sm.step(released, None), StepAction::Idle);
         assert!(!sm.is_dragging());
+    }
+
+    #[test]
+    fn sub_2mm_button_tap_skips_preview_until_threshold_crossed() {
+        let mut sm = DragStateMachine::new();
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let down = InputFrame {
+            left: hand(true, 1, (0.0, 1.0, 0.0)),
+            right: HandInput::UNPRESSED,
+        };
+        assert_eq!(sm.step(down, Some(m0)), StepAction::Idle);
+
+        // 1mm tremor stays Idle without emitting UpdatePlayspace.
+        let tiny = InputFrame {
+            left: hand(true, 1, (0.001, 1.0005, 0.0)),
+            right: HandInput::UNPRESSED,
+        };
+        assert_eq!(sm.step(tiny, None), StepAction::Idle);
+
+        // Releasing after tiny tremor also stays Idle without emitting CommitPlayspace.
+        let up = InputFrame {
+            left: hand(false, 1, (0.001, 1.0005, 0.0)),
+            right: HandInput::UNPRESSED,
+        };
+        assert_eq!(sm.step(up, None), StepAction::Idle);
     }
 }
