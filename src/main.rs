@@ -4,7 +4,7 @@
 use core::fmt::Write;
 
 use nexashift::math::{HmdMatrix34_t, SimdMath, Vec3};
-use nexashift::openvr::{OpenVrError, OpenVrSession, set_steamvr_autolaunch};
+use nexashift::openvr::{OpenVrError, OpenVrSession, ShmMonitorManager, set_steamvr_autolaunch};
 use nexashift::platform::{
     MonotonicClock, ReactiveWaiter, StackBuf, WaitOutcome, command_line_has_flag,
     install_signal_handlers, is_running, query_chaperone_file_stamp, query_process_stats,
@@ -225,20 +225,23 @@ fn run_bench(simd: SimdMath) -> i32 {
     };
 
     let _ = session.sample_inputs(None, None, 0);
-    let mut monitor = session.open_bare_metal_monitor();
+    let clock = MonotonicClock::new();
+    let mut shm_mgr = ShmMonitorManager::new(&session, clock.now_ns());
     let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
 
     print_out(format_args!(
-        "bench[init]: simd={}, hmd_hz={}, shm={}, shm_slots={}, bound_slots={}, idle_period_ms={}\n",
+        "bench[init]: simd={}, runtime={}, hmd_hz={}, shm={}, layout={}, trust={}, shm_slots={}, bound_slots={}, idle_period_ms={}\n",
         simd.level_name(),
+        session.runtime_version(),
         session.hmd_refresh_hz() as u32,
-        monitor.is_some(),
-        monitor.as_ref().map_or(0, |m| m.watched_slot_count()),
-        monitor.as_ref().map_or(0, |m| m.watched_bound_count()),
+        shm_mgr.is_shm_active(),
+        shm_mgr.layout_name(),
+        shm_mgr.trust().as_str(),
+        shm_mgr.watched_slot_count(),
+        shm_mgr.watched_bound_count(),
         idle_period_ms
     ));
 
-    let clock = MonotonicClock::new();
     let waiter = ReactiveWaiter::new();
     let mut sm = DragStateMachine::with_simd(simd);
 
@@ -254,7 +257,7 @@ fn run_bench(simd: SimdMath) -> i32 {
         if now_ns.saturating_sub(idle_t0) >= bench_duration_ns {
             break;
         }
-        let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
+        let watch_handle = shm_mgr.vrserver_wait_handle();
         match waiter.wait_idle_tick(watch_handle, idle_period_ms) {
             WaitOutcome::Tick => {}
             WaitOutcome::Stop | WaitOutcome::ServerExited => break,
@@ -263,26 +266,13 @@ fn run_bench(simd: SimdMath) -> i32 {
             break;
         }
         let now_ns = clock.now_ns();
-        let (should_sample, bindings_changed) = match monitor.as_mut() {
-            Some(m) => m.poll_should_sample(simd, now_ns),
-            None => (true, false),
-        };
-        let event_bindings_dirty = session.take_bindings_dirty();
-        if should_sample || event_bindings_dirty {
-            let frame = session.sample_inputs(sm.active_device_hint(), monitor.as_mut(), now_ns);
+        if shm_mgr.poll_idle(&session, simd, now_ns) {
+            let frame = session.sample_inputs(
+                sm.active_device_hint(),
+                shm_mgr.monitor_mut(),
+                now_ns,
+            );
             let _ = sm.step_with(frame, || session.get_working_standing_pose());
-            if bindings_changed || event_bindings_dirty {
-                let mut drop_monitor = false;
-                if let Some(m) = monitor.as_mut() {
-                    m.set_max_watched_component_type(session.space_drag_max_component_type());
-                    if !m.rebuild_for_session(&session) {
-                        drop_monitor = true;
-                    }
-                }
-                if drop_monitor {
-                    monitor = None;
-                }
-            }
         }
         idle_wakeups += 1;
     }
@@ -341,7 +331,8 @@ fn run_bench(simd: SimdMath) -> i32 {
             break;
         }
         let iter_t0 = clock.now_ns();
-        let _real_frame = session.sample_inputs(drag_sm.active_device_hint(), monitor.as_mut(), iter_t0);
+        let _real_frame =
+            session.sample_inputs(drag_sm.active_device_hint(), shm_mgr.monitor_mut(), iter_t0);
         let phase = ((drag_wakeups % 120) as f32) / 120.0;
         let offset = if phase <= 0.5 {
             phase * 0.04
@@ -413,6 +404,35 @@ fn run_bench(simd: SimdMath) -> i32 {
     0
 }
 
+fn run_probe(simd: SimdMath) -> i32 {
+    let session = match OpenVrSession::init(true) {
+        Ok(s) => s,
+        Err(e) => {
+            print_openvr_error(e);
+            return 1;
+        }
+    };
+
+    let _ = session.sample_inputs(None, None, 0);
+    let clock = MonotonicClock::new();
+    let shm_mgr = ShmMonitorManager::new(&session, clock.now_ns());
+
+    print_out(format_args!(
+        "probe: simd={}, runtime={}, hmd_hz={}, shm={}, layout={}, trust={}, shm_slots={}, bound_slots={}, fast_drag={}\n",
+        simd.level_name(),
+        session.runtime_version(),
+        session.hmd_refresh_hz() as u32,
+        shm_mgr.is_shm_active(),
+        shm_mgr.layout_name(),
+        shm_mgr.trust().as_str(),
+        shm_mgr.watched_slot_count(),
+        shm_mgr.watched_bound_count(),
+        shm_mgr.has_validated_bindings()
+    ));
+
+    0
+}
+
 fn run_daemon(simd: SimdMath) -> i32 {
     install_signal_handlers();
 
@@ -425,18 +445,22 @@ fn run_daemon(simd: SimdMath) -> i32 {
     };
 
     let _ = session.sample_inputs(None, None, 0);
-    let mut monitor = session.open_bare_metal_monitor();
+    let clock = MonotonicClock::new();
+    let mut shm_mgr = ShmMonitorManager::new(&session, clock.now_ns());
     let idle_period_ms = idle_period_ms_for_hmd(session.hmd_refresh_hz());
 
-    let clock = MonotonicClock::new();
     let waiter = ReactiveWaiter::new();
     let mut sm = DragStateMachine::with_simd(simd);
     let mut tick: u64 = 0;
+    let mut idle_timer_armed = false;
 
     while is_running() {
         let was_dragging = sm.is_dragging();
         if was_dragging {
-            waiter.disarm_idle_timer();
+            if idle_timer_armed {
+                waiter.disarm_idle_timer();
+                idle_timer_armed = false;
+            }
             wait_next_vr_frame(&session, &waiter);
             if !is_running() {
                 break;
@@ -447,29 +471,21 @@ fn run_daemon(simd: SimdMath) -> i32 {
             tick = tick.wrapping_add(1);
 
             let now_ns = clock.now_ns();
-            let frame = session.sample_inputs(sm.active_device_hint(), monitor.as_mut(), now_ns);
+            let frame =
+                session.sample_inputs(sm.active_device_hint(), shm_mgr.monitor_mut(), now_ns);
             if let StepAction::UpdatePlayspace(m) =
                 sm.step_with(frame, || session.get_working_standing_pose())
             {
                 session.apply_working_standing_pose(&m);
             }
             if !sm.is_dragging() {
-                let now_ns = clock.now_ns();
-                let mut drop_monitor = false;
-                if let Some(m) = monitor.as_mut() {
-                    m.extend_grace(now_ns);
-                    if !m.rebuild_for_session(&session) {
-                        drop_monitor = true;
-                    }
-                }
-                if drop_monitor {
-                    monitor = None;
-                }
+                shm_mgr.on_drag_finished(&session, clock.now_ns());
             }
             continue;
         }
 
-        let watch_handle = monitor.as_ref().and_then(|m| m.vrserver_wait_handle());
+        let watch_handle = shm_mgr.vrserver_wait_handle();
+        idle_timer_armed = true;
         match waiter.wait_idle_tick(watch_handle, idle_period_ms) {
             WaitOutcome::Tick => {}
             WaitOutcome::Stop | WaitOutcome::ServerExited => break,
@@ -480,28 +496,15 @@ fn run_daemon(simd: SimdMath) -> i32 {
         tick = tick.wrapping_add(1);
 
         let now_ns = clock.now_ns();
-        let (should_sample, bindings_changed) = match monitor.as_mut() {
-            Some(m) => m.poll_should_sample(simd, now_ns),
-            None => (true, false),
-        };
-        let event_bindings_dirty = session.take_bindings_dirty();
-        if !should_sample && !event_bindings_dirty {
+        if !shm_mgr.poll_idle(&session, simd, now_ns) {
             continue;
         }
 
-        let frame = session.sample_inputs(sm.active_device_hint(), monitor.as_mut(), now_ns);
-        if bindings_changed || event_bindings_dirty {
-            let mut drop_monitor = false;
-            if let Some(m) = monitor.as_mut() {
-                m.set_max_watched_component_type(session.space_drag_max_component_type());
-                if !m.rebuild_for_session(&session) {
-                    drop_monitor = true;
-                }
-            }
-            if drop_monitor {
-                monitor = None;
-            }
-        }
+        let frame = session.sample_inputs(
+            sm.active_device_hint(),
+            shm_mgr.monitor_mut(),
+            now_ns,
+        );
         // Keep changes in the live working-set preview mid-session; calling CommitWorkingCopy
         // while VR is running makes vrcompositor re-center the SteamVR Dashboard.
         if let StepAction::UpdatePlayspace(m) =
@@ -522,7 +525,7 @@ fn app_main() -> i32 {
     if command_line_has_flag(b"--help") || command_line_has_flag(b"-h") {
         print_out(format_args!(
             "nexashift - headless reactive 1:1 3D SteamVR playspace drag (simd={})\n\
-             usage: nexashift [--install | --uninstall | --poc | --bench | --help]\n",
+             usage: nexashift [--install | --uninstall | --probe | --poc | --bench | --help]\n",
             simd.level_name()
         ));
         return 0;
@@ -554,6 +557,9 @@ fn app_main() -> i32 {
                 1
             }
         };
+    }
+    if command_line_has_flag(b"--probe") {
+        return run_probe(simd);
     }
     if command_line_has_flag(b"--poc") {
         return run_poc(simd);

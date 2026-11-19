@@ -271,6 +271,34 @@ mod imp {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
+    pub(super) struct MemoryBasicInformation {
+        base_address: *const c_void,
+        allocation_base: *const c_void,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        mem_type: u32,
+    }
+
+    impl Default for MemoryBasicInformation {
+        fn default() -> Self {
+            Self {
+                base_address: core::ptr::null(),
+                allocation_base: core::ptr::null(),
+                allocation_protect: 0,
+                partition_id: 0,
+                region_size: 0,
+                state: 0,
+                protect: 0,
+                mem_type: 0,
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
     pub(super) struct ProcessEntry32W {
         dw_size: u32,
         cnt_usage: u32,
@@ -383,6 +411,11 @@ mod imp {
             dwNumberOfBytesToMap: usize,
         ) -> *const c_void;
         fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> i32;
+        fn VirtualQuery(
+            lpAddress: *const c_void,
+            lpBuffer: *mut MemoryBasicInformation,
+            dwLength: usize,
+        ) -> usize;
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
         fn GetCurrentProcessId() -> u32;
         fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> isize;
@@ -650,16 +683,35 @@ mod imp {
     }
 
     impl MappedReadOnlyShm {
-        pub fn open_utf8(name_nul: &[u8], len: usize) -> Option<Self> {
+        pub fn open_utf8(name_nul: &[u8], min_len: usize) -> Option<Self> {
             let mut wide = [0u16; 260];
             utf8_nul_to_utf16(name_nul, &mut wide)?;
             let map_handle = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
             if map_handle == 0 {
                 return None;
             }
-            let view = unsafe { MapViewOfFile(map_handle, FILE_MAP_READ, 0, 0, len) } as *const u8;
+            // Map the full section (size = 0) and inspect the committed region size via VirtualQuery.
+            let view = unsafe { MapViewOfFile(map_handle, FILE_MAP_READ, 0, 0, 0) } as *const u8;
             if view.is_null() {
                 unsafe {
+                    let _ = CloseHandle(map_handle);
+                }
+                return None;
+            }
+            let mut mbi = MemoryBasicInformation::default();
+            let queried = unsafe {
+                VirtualQuery(
+                    view.cast(),
+                    &mut mbi,
+                    core::mem::size_of::<MemoryBasicInformation>(),
+                )
+            };
+            if queried < core::mem::size_of::<MemoryBasicInformation>()
+                || mbi.region_size < min_len
+                || ((view as usize) & 7) != 0
+            {
+                unsafe {
+                    let _ = UnmapViewOfFile(view.cast());
                     let _ = CloseHandle(map_handle);
                 }
                 return None;
@@ -667,8 +719,13 @@ mod imp {
             Some(Self {
                 map_handle,
                 view,
-                len,
+                len: mbi.region_size,
             })
+        }
+
+        #[inline]
+        pub fn len(&self) -> usize {
+            self.len
         }
 
         #[inline]
@@ -682,7 +739,7 @@ mod imp {
 
         #[inline]
         pub fn read_volatile_u32(&self, byte_offset: usize) -> Option<u32> {
-            if byte_offset.checked_add(4)? > self.len {
+            if (byte_offset & 3) != 0 || byte_offset.checked_add(4)? > self.len {
                 return None;
             }
             let ptr = unsafe { self.view.add(byte_offset) } as *const u32;
@@ -691,7 +748,7 @@ mod imp {
 
         #[inline]
         pub fn read_volatile_u64(&self, byte_offset: usize) -> Option<u64> {
-            if byte_offset.checked_add(8)? > self.len {
+            if (byte_offset & 7) != 0 || byte_offset.checked_add(8)? > self.len {
                 return None;
             }
             let ptr = unsafe { self.view.add(byte_offset) } as *const u64;
@@ -700,6 +757,9 @@ mod imp {
 
         #[inline]
         pub fn copy_volatile_u32_words(&self, byte_offset: usize, dst: &mut [u32]) -> bool {
+            if (byte_offset & 3) != 0 {
+                return false;
+            }
             let Some(byte_len) = dst.len().checked_mul(4) else {
                 return false;
             };
@@ -812,8 +872,8 @@ mod imp {
                 let _ = write!(state_name, "VR_InputState_{}-IPCWrapper\0", server_pid);
 
                 if let (Some(conn_shm), Some(state_shm)) = (
-                    MappedReadOnlyShm::open_utf8(conn_name.as_bytes(), 0x420),
-                    MappedReadOnlyShm::open_utf8(state_name.as_bytes(), 0x9810),
+                    MappedReadOnlyShm::open_utf8(conn_name.as_bytes(), 64),
+                    MappedReadOnlyShm::open_utf8(state_name.as_bytes(), 64),
                 ) {
                     let wait_handle = ProcessWaitHandle::open_sync(server_pid);
                     found = Some((server_pid, wait_handle, state_shm, conn_shm));
@@ -840,12 +900,7 @@ mod imp {
             "PC_{:x}_header_{}-IPCWrapper\0",
             container_id, server_pid
         );
-        let hdr_shm = MappedReadOnlyShm::open_utf8(hdr_name.as_bytes(), 64)?;
-        let count = hdr_shm.read_volatile_u32(4)?;
-        let storage_sz = hdr_shm.read_volatile_u32(8)?;
-        if count == 0 || count > 512 || storage_sz == 0 || storage_sz > 65_536 {
-            return None;
-        }
+        let hdr_shm = MappedReadOnlyShm::open_utf8(hdr_name.as_bytes(), 16)?;
 
         let mut tbl_name = StackBuf::<128>::new();
         let _ = write!(
@@ -853,7 +908,7 @@ mod imp {
             "PC_{:x}_table0_{}-IPCWrapper\0",
             container_id, server_pid
         );
-        let tbl_shm = MappedReadOnlyShm::open_utf8(tbl_name.as_bytes(), (count as usize) * 28)?;
+        let tbl_shm = MappedReadOnlyShm::open_utf8(tbl_name.as_bytes(), 16)?;
 
         let mut sto_name = StackBuf::<128>::new();
         let _ = write!(
@@ -861,7 +916,7 @@ mod imp {
             "PC_{:x}_storage0_{}-IPCWrapper\0",
             container_id, server_pid
         );
-        let sto_shm = MappedReadOnlyShm::open_utf8(sto_name.as_bytes(), storage_sz as usize)?;
+        let sto_shm = MappedReadOnlyShm::open_utf8(sto_name.as_bytes(), 16)?;
         Some((hdr_shm, tbl_shm, sto_shm))
     }
 
@@ -1430,6 +1485,11 @@ mod imp {
 
     impl MappedReadOnlyShm {
         #[inline]
+        pub fn len(&self) -> usize {
+            0
+        }
+
+        #[inline]
         pub fn read_volatile_u8(&self, _byte_offset: usize) -> Option<u8> {
             None
         }
@@ -1783,6 +1843,7 @@ mod tests {
     #[test]
     fn windows_process_entry32w_size() {
         assert_eq!(core::mem::size_of::<imp::ProcessEntry32W>(), 568);
+        assert_eq!(core::mem::size_of::<imp::MemoryBasicInformation>(), 48);
     }
 
     #[test]
