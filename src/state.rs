@@ -191,18 +191,9 @@ impl DragStateMachine {
                 let delta = self.simd.sub_vec3(active.position_raw, c0);
                 // Ignore sub-2mm tremor before the drag actually starts so a quick tap
                 // never attaches a live working-set preview to SteamVR.
-                let delta_sq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-                if !moved && delta_sq < (0.002 * 0.002) {
-                    return StepAction::Idle;
-                }
-                // While already dragging, filter sub-0.5mm IMU jitter relative to last_raw
-                // so holding the controller still does not spam ShowWorkingSetPreview IPC/logs.
-                if moved {
-                    let step_delta = self.simd.sub_vec3(active.position_raw, last_raw);
-                    let step_sq = step_delta.x * step_delta.x
-                        + step_delta.y * step_delta.y
-                        + step_delta.z * step_delta.z;
-                    if step_sq < (0.0005 * 0.0005) {
+                if !moved {
+                    let delta_sq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                    if delta_sq < (0.002 * 0.002) {
                         return StepAction::Idle;
                     }
                 }
@@ -563,59 +554,5 @@ mod tests {
             right: HandInput::UNPRESSED,
         };
         assert_eq!(sm.step(up, None), StepAction::Idle);
-    }
-
-    #[test]
-    fn sub_half_mm_jitter_during_drag_skips_redundant_preview_updates_without_drift() {
-        let mut sm = DragStateMachine::new();
-        let m0 = HmdMatrix34_t::IDENTITY;
-
-        assert_eq!(
-            sm.step(
-                InputFrame {
-                    left: hand(true, 1, (0.0, 1.0, 0.0)),
-                    right: HandInput::UNPRESSED,
-                },
-                Some(m0),
-            ),
-            StepAction::Idle
-        );
-
-        let moved_pos = (0.0, 1.05, 0.0);
-        let expected_moved = apply_raw_translation(&m0, Vec3::new(0.0, 1.05f32 - 1.0f32, 0.0));
-        assert_eq!(
-            sm.step(
-                InputFrame {
-                    left: hand(true, 1, moved_pos),
-                    right: HandInput::UNPRESSED,
-                },
-                None,
-            ),
-            StepAction::UpdatePlayspace(expected_moved)
-        );
-
-        // 0.2mm jitter around (0.0, 1.05, 0.0) must be filtered out while holding still.
-        assert_eq!(
-            sm.step(
-                InputFrame {
-                    left: hand(true, 1, (0.0002, 1.0501, -0.0001)),
-                    right: HandInput::UNPRESSED,
-                },
-                None,
-            ),
-            StepAction::Idle
-        );
-
-        // Moving back to exact c0 emits exact m0 with zero drift.
-        assert_eq!(
-            sm.step(
-                InputFrame {
-                    left: hand(true, 1, (0.0, 1.0, 0.0)),
-                    right: HandInput::UNPRESSED,
-                },
-                None,
-            ),
-            StepAction::UpdatePlayspace(m0)
-        );
     }
 }
