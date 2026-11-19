@@ -273,6 +273,102 @@ impl Default for DragStateMachine {
     }
 }
 
+/// Persistence action returned by [`PlayspacePersistenceController`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PersistOp {
+    None,
+    CommitNow(HmdMatrix34_t),
+}
+
+/// Tracks playspace preview and commit lifecycle so SteamVR's chaperone preview watchdog never
+/// snaps the user's position back on app close, without resetting the Dashboard mid-session.
+pub struct PlayspacePersistenceController {
+    startup_pose: Option<HmdMatrix34_t>,
+    last_preview_pose: Option<HmdMatrix34_t>,
+    pending_commit: Option<HmdMatrix34_t>,
+    ever_moved: bool,
+}
+
+impl PlayspacePersistenceController {
+    #[inline]
+    pub const fn new(startup_pose: Option<HmdMatrix34_t>) -> Self {
+        Self {
+            startup_pose,
+            last_preview_pose: None,
+            pending_commit: None,
+            ever_moved: false,
+        }
+    }
+
+    #[inline]
+    pub fn on_preview_update(&mut self, mat: HmdMatrix34_t) {
+        self.last_preview_pose = Some(mat);
+        self.ever_moved = true;
+    }
+
+    pub fn on_drag_finished(&mut self, mat: HmdMatrix34_t, dashboard_visible: bool) -> PersistOp {
+        self.last_preview_pose = None;
+        self.ever_moved = true;
+        if dashboard_visible {
+            self.pending_commit = Some(mat);
+            PersistOp::None
+        } else {
+            self.pending_commit = None;
+            PersistOp::CommitNow(mat)
+        }
+    }
+
+    pub fn on_drag_aborted(&mut self, dashboard_visible: bool) -> PersistOp {
+        if let Some(mat) = self.last_preview_pose.take() {
+            self.on_drag_finished(mat, dashboard_visible)
+        } else {
+            PersistOp::None
+        }
+    }
+
+    #[inline]
+    pub fn has_pending_commit(&self) -> bool {
+        self.pending_commit.is_some()
+    }
+
+    #[inline]
+    pub fn poll_deferred_commit(&mut self, dashboard_visible: bool) -> PersistOp {
+        if !dashboard_visible
+            && let Some(mat) = self.pending_commit.take()
+        {
+            return PersistOp::CommitNow(mat);
+        }
+        PersistOp::None
+    }
+
+    /// Commits the latest dragged/pending pose before a mid-session exit so SteamVR does not
+    /// reload the pre-drag file pose when the process disconnects.
+    pub fn on_app_exit(&mut self) -> PersistOp {
+        if let Some(mat) = self
+            .pending_commit
+            .take()
+            .or_else(|| self.last_preview_pose.take())
+        {
+            PersistOp::CommitNow(mat)
+        } else {
+            PersistOp::None
+        }
+    }
+
+    /// Restores the calibrated startup center only when SteamVR itself is shutting down.
+    pub fn on_steamvr_quit(&mut self) -> PersistOp {
+        self.pending_commit = None;
+        self.last_preview_pose = None;
+        if self.ever_moved
+            && let Some(startup) = self.startup_pose
+        {
+            PersistOp::CommitNow(startup)
+        } else {
+            PersistOp::None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +650,377 @@ mod tests {
             right: HandInput::UNPRESSED,
         };
         assert_eq!(sm.step(up, None), StepAction::Idle);
+    }
+
+    /// Models SteamVR `vrserver` + `vrcompositor` chaperone preview/commit ownership rules.
+    struct FakeVrServer {
+        app_pid: u32,
+        live_pose: HmdMatrix34_t,
+        disk_vrchap: HmdMatrix34_t,
+        working_pose: HmdMatrix34_t,
+        showing_working_pid: Option<u32>,
+        dashboard_open: bool,
+        dashboard_reset_count: u32,
+        reloaded_from_disk_count: u32,
+    }
+
+    impl FakeVrServer {
+        fn new(initial: HmdMatrix34_t, app_pid: u32) -> Self {
+            Self {
+                app_pid,
+                live_pose: initial,
+                disk_vrchap: initial,
+                working_pose: initial,
+                showing_working_pid: None,
+                dashboard_open: false,
+                dashboard_reset_count: 0,
+                reloaded_from_disk_count: 0,
+            }
+        }
+
+        fn apply_preview(&mut self, mat: HmdMatrix34_t) {
+            self.working_pose = mat;
+            self.live_pose = mat;
+            self.showing_working_pid = Some(self.app_pid);
+        }
+
+        fn commit_and_hide(&mut self, mat: HmdMatrix34_t) {
+            self.working_pose = mat;
+            self.disk_vrchap = mat;
+            self.live_pose = mat;
+            if self.dashboard_open {
+                self.dashboard_reset_count += 1;
+            }
+            self.showing_working_pid = None;
+        }
+
+        fn dispatch_op(&mut self, op: PersistOp) {
+            if let PersistOp::CommitNow(m) = op {
+                self.commit_and_hide(m);
+            }
+        }
+
+        fn on_app_process_exited(&mut self) {
+            // Reproduces CVRChaperoneServer::RunFrame: if the previewing PID vanished without
+            // committing + hiding, vrserver reloads chaperone_info.vrchap and snaps position back.
+            if self.showing_working_pid == Some(self.app_pid) {
+                self.showing_working_pid = None;
+                self.live_pose = self.disk_vrchap;
+                self.working_pose = self.disk_vrchap;
+                self.reloaded_from_disk_count += 1;
+            }
+        }
+    }
+
+    fn run_step_on_fake(
+        sm: &mut DragStateMachine,
+        ctrl: &mut PlayspacePersistenceController,
+        server: &mut FakeVrServer,
+        frame: InputFrame,
+    ) {
+        let action = sm.step(frame, Some(server.working_pose));
+        match action {
+            StepAction::Idle => {}
+            StepAction::UpdatePlayspace(m) => {
+                ctrl.on_preview_update(m);
+                server.apply_preview(m);
+            }
+            StepAction::CommitPlayspace(m) => {
+                let op = ctrl.on_drag_finished(m, server.dashboard_open);
+                server.dispatch_op(op);
+            }
+            StepAction::AbortDrag => {
+                let op = ctrl.on_drag_aborted(server.dashboard_open);
+                server.dispatch_op(op);
+            }
+        }
+    }
+
+    #[test]
+    fn closing_app_cleanly_after_drag_does_not_shift_position() {
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let mut server = FakeVrServer::new(m0, 4242);
+        let mut sm = DragStateMachine::new();
+        let mut ctrl = PlayspacePersistenceController::new(Some(m0));
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 1.0, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.25, 1.4, -0.3)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        let dragged_pose = server.live_pose;
+        assert_ne!(dragged_pose, m0);
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(false, 1, (0.25, 1.4, -0.3)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+
+        let exit_op = ctrl.on_app_exit();
+        server.dispatch_op(exit_op);
+        server.on_app_process_exited();
+
+        assert_eq!(server.live_pose, dragged_pose);
+        assert_eq!(server.reloaded_from_disk_count, 0);
+        assert_eq!(server.dashboard_reset_count, 0);
+    }
+
+    #[test]
+    fn killing_app_with_taskkill_after_drag_does_not_shift_position() {
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let mut server = FakeVrServer::new(m0, 4242);
+        let mut sm = DragStateMachine::new();
+        let mut ctrl = PlayspacePersistenceController::new(Some(m0));
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 1.0, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 1.5, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        let dragged_pose = server.live_pose;
+
+        // Release drag trigger outside Dashboard -> already committed to vrserver & preview hidden.
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(false, 1, (0.0, 1.5, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+
+        // Simulate abrupt taskkill without calling on_app_exit().
+        server.on_app_process_exited();
+
+        assert_eq!(server.live_pose, dragged_pose);
+        assert_eq!(server.reloaded_from_disk_count, 0);
+        assert_eq!(server.dashboard_reset_count, 0);
+    }
+
+    #[test]
+    fn dragging_inside_dashboard_defers_commit_and_closing_after_dashboard_preserves_position() {
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let mut server = FakeVrServer::new(m0, 4242);
+        server.dashboard_open = true;
+        let mut sm = DragStateMachine::new();
+        let mut ctrl = PlayspacePersistenceController::new(Some(m0));
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 1.0, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.15, 0.85, 0.2)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        let dragged_pose = server.live_pose;
+
+        // Release while Dashboard is open -> deferred so Dashboard never resets.
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(false, 1, (0.15, 0.85, 0.2)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        assert!(ctrl.has_pending_commit());
+        assert_eq!(server.dashboard_reset_count, 0);
+        assert_eq!(server.live_pose, dragged_pose);
+
+        // Polling while Dashboard remains open stays deferred.
+        assert_eq!(
+            ctrl.poll_deferred_commit(server.dashboard_open),
+            PersistOp::None
+        );
+        assert_eq!(server.dashboard_reset_count, 0);
+
+        // Once Dashboard closes, deferred commit persists immediately with zero Dashboard resets.
+        server.dashboard_open = false;
+        let op = ctrl.poll_deferred_commit(server.dashboard_open);
+        assert_eq!(op, PersistOp::CommitNow(dragged_pose));
+        server.dispatch_op(op);
+        assert!(!ctrl.has_pending_commit());
+        assert_eq!(server.dashboard_reset_count, 0);
+
+        // Hard kill or normal close after Dashboard closed keeps the exact pose.
+        server.on_app_process_exited();
+        assert_eq!(server.live_pose, dragged_pose);
+        assert_eq!(server.reloaded_from_disk_count, 0);
+    }
+
+    #[test]
+    fn clean_close_while_dashboard_is_still_open_commits_and_preserves_position() {
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let mut server = FakeVrServer::new(m0, 4242);
+        server.dashboard_open = true;
+        let mut sm = DragStateMachine::new();
+        let mut ctrl = PlayspacePersistenceController::new(Some(m0));
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 1.0, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (-0.2, 1.3, 0.4)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        let dragged_pose = server.live_pose;
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(false, 1, (-0.2, 1.3, 0.4)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        assert!(ctrl.has_pending_commit());
+
+        // App closes cleanly while Dashboard is still open -> on_app_exit flushes commit first.
+        let exit_op = ctrl.on_app_exit();
+        assert_eq!(exit_op, PersistOp::CommitNow(dragged_pose));
+        server.dispatch_op(exit_op);
+        server.on_app_process_exited();
+
+        assert_eq!(server.live_pose, dragged_pose);
+        assert_eq!(server.reloaded_from_disk_count, 0);
+    }
+
+    #[test]
+    fn steamvr_quit_restores_startup_center_pose_only_if_moved() {
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let mut untouched = PlayspacePersistenceController::new(Some(m0));
+        assert_eq!(untouched.on_steamvr_quit(), PersistOp::None);
+
+        let mut server = FakeVrServer::new(m0, 4242);
+        let mut sm = DragStateMachine::new();
+        let mut ctrl = PlayspacePersistenceController::new(Some(m0));
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 1.0, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.1, 1.25, -0.1)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(false, 1, (0.1, 1.25, -0.1)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+
+        let quit_op = ctrl.on_steamvr_quit();
+        assert_eq!(quit_op, PersistOp::CommitNow(m0));
+        server.dispatch_op(quit_op);
+        assert_eq!(server.disk_vrchap, m0);
+        assert_eq!(server.live_pose, m0);
+    }
+
+    #[test]
+    fn mid_drag_clean_exit_commits_preview_and_preserves_position() {
+        let m0 = HmdMatrix34_t::IDENTITY;
+        let mut server = FakeVrServer::new(m0, 4242);
+        let mut sm = DragStateMachine::new();
+        let mut ctrl = PlayspacePersistenceController::new(Some(m0));
+
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 1.0, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        run_step_on_fake(
+            &mut sm,
+            &mut ctrl,
+            &mut server,
+            InputFrame {
+                left: hand(true, 1, (0.0, 0.7, 0.0)),
+                right: HandInput::UNPRESSED,
+            },
+        );
+        let dragged_pose = server.live_pose;
+        assert_ne!(dragged_pose, m0);
+
+        // User closes app cleanly without releasing drag button first.
+        let exit_op = ctrl.on_app_exit();
+        assert_eq!(exit_op, PersistOp::CommitNow(dragged_pose));
+        server.dispatch_op(exit_op);
+        server.on_app_process_exited();
+
+        assert_eq!(server.live_pose, dragged_pose);
+        assert_eq!(server.reloaded_from_disk_count, 0);
     }
 }

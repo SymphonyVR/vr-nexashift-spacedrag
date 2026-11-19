@@ -271,7 +271,9 @@ pub struct VR_IVRInput_FnTable {
 pub struct VR_IVROverlay_FnTable {
     pub _before_wait_frame_sync: [*const c_void; 47],
     pub wait_frame_sync: unsafe extern "system" fn(n_timeout_ms: u32) -> i32,
-    pub _after_wait_frame_sync: [*const c_void; 34],
+    pub _between_wait_and_dashboard: [*const c_void; 20],
+    pub is_dashboard_visible: unsafe extern "system" fn() -> bool,
+    pub _after_dashboard: [*const c_void; 13],
 }
 
 #[repr(C)]
@@ -514,6 +516,11 @@ impl OpenVrSession {
     }
 
     #[inline]
+    pub fn is_dashboard_visible(&self) -> bool {
+        unsafe { ((*self.vr_overlay).is_dashboard_visible)() }
+    }
+
+    #[inline]
     pub fn hmd_refresh_hz(&self) -> f32 {
         self.hmd_refresh_hz
     }
@@ -602,7 +609,6 @@ impl OpenVrSession {
                 let ev = event.assume_init();
                 match ev.event_type {
                     VR_EVENT_QUIT => {
-                        ((*self.vr_system).acknowledge_quit_exiting)();
                         should_quit = true;
                     }
                     VR_EVENT_CHAPERONE_TEMP_DATA_HAS_CHANGED => {
@@ -627,6 +633,13 @@ impl OpenVrSession {
             }
         }
         should_quit
+    }
+
+    #[inline]
+    pub fn acknowledge_quit_exiting(&self) {
+        unsafe {
+            ((*self.vr_system).acknowledge_quit_exiting)();
+        }
     }
 
     pub fn sample_inputs(
@@ -911,6 +924,23 @@ impl OpenVrSession {
         }
         self.working_set_synced.set(true);
         self.dirty_uncommitted.set(true);
+    }
+
+    /// Commits `mat` into SteamVR's live chaperone config and clears `showing_working_pid` so
+    /// closing or killing the daemon never makes `vrserver` reload the pre-drag pose.
+    pub fn commit_working_standing_pose(&self, mat: &HmdMatrix34_t) -> bool {
+        let committed = unsafe {
+            ((*self.chaperone_setup).set_working_standing_zero_pose_to_raw_tracking_pose)(mat);
+            ((*self.chaperone_setup).commit_working_copy)(E_CHAPERONE_CONFIG_FILE_LIVE)
+        };
+        if committed {
+            unsafe {
+                ((*self.chaperone_setup).hide_working_set_preview)();
+            }
+            self.dirty_uncommitted.set(false);
+            self.working_set_synced.set(false);
+        }
+        committed
     }
 
     pub fn restore_working_preview(&self) {
@@ -3460,6 +3490,10 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(VR_IVROverlay_FnTable, wait_frame_sync),
             47 * size_of::<*const c_void>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(VR_IVROverlay_FnTable, is_dashboard_visible),
+            68 * size_of::<*const c_void>()
         );
         assert_eq!(
             core::mem::offset_of!(VR_IVRApplications_FnTable, set_application_auto_launch),

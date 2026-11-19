@@ -10,7 +10,9 @@ use nexashift::platform::{
     install_signal_handlers, is_running, query_chaperone_file_stamp, query_process_stats,
     write_stderr, write_stdout,
 };
-use nexashift::state::{DragStateMachine, HandInput, InputFrame, StepAction};
+use nexashift::state::{
+    DragStateMachine, HandInput, InputFrame, PersistOp, PlayspacePersistenceController, StepAction,
+};
 
 #[cfg(all(not(test), target_os = "windows"))]
 #[link(name = "vcruntime")]
@@ -263,6 +265,7 @@ fn run_bench(simd: SimdMath) -> i32 {
             WaitOutcome::Stop | WaitOutcome::ServerExited => break,
         }
         if (idle_wakeups & 63) == 0 && session.poll_should_quit() {
+            session.acknowledge_quit_exiting();
             break;
         }
         let now_ns = clock.now_ns();
@@ -327,7 +330,11 @@ fn run_bench(simd: SimdMath) -> i32 {
 
     while is_running() && clock.now_ns().saturating_sub(drag_t0) < bench_duration_ns {
         wait_next_vr_frame(&session, &waiter);
-        if !is_running() || ((drag_wakeups & 31) == 0 && session.poll_should_quit()) {
+        if !is_running() {
+            break;
+        }
+        if (drag_wakeups & 31) == 0 && session.poll_should_quit() {
+            session.acknowledge_quit_exiting();
             break;
         }
         let iter_t0 = clock.now_ns();
@@ -433,6 +440,35 @@ fn run_probe(simd: SimdMath) -> i32 {
     0
 }
 
+#[inline]
+fn handle_step_action(
+    session: &OpenVrSession,
+    persistence: &mut PlayspacePersistenceController,
+    action: StepAction,
+) {
+    match action {
+        StepAction::Idle => {}
+        StepAction::UpdatePlayspace(m) => {
+            persistence.on_preview_update(m);
+            session.apply_working_standing_pose(&m);
+        }
+        StepAction::CommitPlayspace(m) => {
+            if let PersistOp::CommitNow(c) =
+                persistence.on_drag_finished(m, session.is_dashboard_visible())
+            {
+                session.commit_working_standing_pose(&c);
+            }
+        }
+        StepAction::AbortDrag => {
+            if let PersistOp::CommitNow(c) =
+                persistence.on_drag_aborted(session.is_dashboard_visible())
+            {
+                session.commit_working_standing_pose(&c);
+            }
+        }
+    }
+}
+
 fn run_daemon(simd: SimdMath) -> i32 {
     install_signal_handlers();
 
@@ -444,6 +480,7 @@ fn run_daemon(simd: SimdMath) -> i32 {
         }
     };
 
+    let startup_pose = session.get_working_standing_pose();
     let _ = session.sample_inputs(None, None, 0);
     let clock = MonotonicClock::new();
     let mut shm_mgr = ShmMonitorManager::new(&session, clock.now_ns());
@@ -451,8 +488,10 @@ fn run_daemon(simd: SimdMath) -> i32 {
 
     let waiter = ReactiveWaiter::new();
     let mut sm = DragStateMachine::with_simd(simd);
+    let mut persistence = PlayspacePersistenceController::new(startup_pose);
     let mut tick: u64 = 0;
     let mut idle_timer_armed = false;
+    let mut steamvr_quitting = false;
 
     while is_running() {
         let was_dragging = sm.is_dragging();
@@ -466,6 +505,7 @@ fn run_daemon(simd: SimdMath) -> i32 {
                 break;
             }
             if (tick & 31) == 0 && session.poll_should_quit() {
+                steamvr_quitting = true;
                 break;
             }
             tick = tick.wrapping_add(1);
@@ -473,11 +513,8 @@ fn run_daemon(simd: SimdMath) -> i32 {
             let now_ns = clock.now_ns();
             let frame =
                 session.sample_inputs(sm.active_device_hint(), shm_mgr.monitor_mut(), now_ns);
-            if let StepAction::UpdatePlayspace(m) =
-                sm.step_with(frame, || session.get_working_standing_pose())
-            {
-                session.apply_working_standing_pose(&m);
-            }
+            let action = sm.step_with(frame, || session.get_working_standing_pose());
+            handle_step_action(&session, &mut persistence, action);
             if !sm.is_dragging() {
                 shm_mgr.on_drag_finished(&session, clock.now_ns());
             }
@@ -491,9 +528,17 @@ fn run_daemon(simd: SimdMath) -> i32 {
             WaitOutcome::Stop | WaitOutcome::ServerExited => break,
         }
         if (tick & 63) == 0 && session.poll_should_quit() {
+            steamvr_quitting = true;
             break;
         }
         tick = tick.wrapping_add(1);
+
+        if persistence.has_pending_commit()
+            && let PersistOp::CommitNow(c) =
+                persistence.poll_deferred_commit(session.is_dashboard_visible())
+        {
+            session.commit_working_standing_pose(&c);
+        }
 
         let now_ns = clock.now_ns();
         if !shm_mgr.poll_idle(&session, simd, now_ns) {
@@ -505,16 +550,21 @@ fn run_daemon(simd: SimdMath) -> i32 {
             shm_mgr.monitor_mut(),
             now_ns,
         );
-        // Keep changes in the live working-set preview mid-session; calling CommitWorkingCopy
-        // while VR is running makes vrcompositor re-center the SteamVR Dashboard.
-        if let StepAction::UpdatePlayspace(m) =
-            sm.step_with(frame, || session.get_working_standing_pose())
-        {
-            session.apply_working_standing_pose(&m);
-        }
+        let action = sm.step_with(frame, || session.get_working_standing_pose());
+        handle_step_action(&session, &mut persistence, action);
     }
 
-    waiter.disarm_idle_timer();
+    if idle_timer_armed {
+        waiter.disarm_idle_timer();
+    }
+    if steamvr_quitting {
+        if let PersistOp::CommitNow(m) = persistence.on_steamvr_quit() {
+            session.commit_working_standing_pose(&m);
+        }
+        session.acknowledge_quit_exiting();
+    } else if let PersistOp::CommitNow(m) = persistence.on_app_exit() {
+        session.commit_working_standing_pose(&m);
+    }
 
     0
 }
